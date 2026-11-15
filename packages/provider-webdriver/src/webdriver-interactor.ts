@@ -24,7 +24,12 @@ import {
   type CloudWebDriverOperation,
   type CloudWebDriverProviderCapabilities,
 } from './capabilities.ts';
-import type { W3CPointerAction, WebDriverClient, WebDriverWindowRect } from './webdriver-client.ts';
+import type {
+  W3CPointerAction,
+  WebDriverClient,
+  WebDriverRouteProfile,
+  WebDriverWindowRect,
+} from './webdriver-client.ts';
 import { isWebDriverRequestTimeout } from './webdriver-transport.ts';
 import { touchPointer } from './webdriver-gestures.ts';
 import {
@@ -93,6 +98,7 @@ export type WebDriverInteractorOptions = {
   backend: Extract<SnapshotResult['backend'], 'android' | 'xctest'>;
   capabilities: CloudWebDriverProviderCapabilities;
   targetId?: string;
+  routeProfile?: WebDriverRouteProfile;
 };
 
 /** The Android keyevents for the system buttons, as the local Android owner sends them. */
@@ -104,6 +110,7 @@ export function createWebDriverInteractor(options: WebDriverInteractorOptions): 
     options.backend,
     options.capabilities,
     options.targetId,
+    options.routeProfile,
   );
 }
 
@@ -112,17 +119,20 @@ class WebDriverInteractor implements Interactor {
   private readonly backend: Extract<SnapshotResult['backend'], 'android' | 'xctest'>;
   private readonly capabilities: CloudWebDriverProviderCapabilities;
   private readonly targetId: string | undefined;
+  private readonly routeProfile: WebDriverRouteProfile;
 
   constructor(
     client: WebDriverClient,
     backend: Extract<SnapshotResult['backend'], 'android' | 'xctest'>,
     capabilities: CloudWebDriverProviderCapabilities,
     targetId?: string,
+    routeProfile: WebDriverRouteProfile = 'appium',
   ) {
     this.client = client;
     this.backend = backend;
     this.capabilities = capabilities;
     this.targetId = targetId;
+    this.routeProfile = routeProfile;
   }
 
   async open(
@@ -143,6 +153,10 @@ class WebDriverInteractor implements Interactor {
     }
     const appId = options?.appBundleId ?? app;
     if (!appId) return;
+    if (this.routeProfile === 'wda' && this.backend === 'xctest') {
+      await this.client.wdaActivateApp(appId);
+      return;
+    }
     await this.client.activateApp(appId);
   }
 
@@ -154,11 +168,19 @@ class WebDriverInteractor implements Interactor {
 
   async close(app: string): Promise<void> {
     if (!app) return;
+    if (this.routeProfile === 'wda' && this.backend === 'xctest') {
+      await this.client.wdaTerminateApp(app);
+      return;
+    }
     await this.client.terminateApp(app);
   }
 
   async tap(x: number, y: number): Promise<Record<string, unknown>> {
     this.requireSupport('tap');
+    if (this.routeProfile === 'wda' && this.backend === 'xctest') {
+      await this.client.wdaTap(x, y);
+      return { backend: 'webdriver-wda', x, y };
+    }
     await this.pointerGesture('tap', [
       { type: 'pointerMove', duration: 0, x, y },
       { type: 'pointerDown', button: 0 },
@@ -303,7 +325,10 @@ class WebDriverInteractor implements Interactor {
       this.backend === 'android' ? await this.readAndroidSnapshotViewport(signal) : undefined;
     const source = await this.readSource(signal);
     signal?.throwIfAborted();
-    const visibility = await this.readSnapshotKeyboardVisibility(signal);
+    const visibility =
+      this.routeProfile === 'wda' && this.backend === 'xctest'
+        ? 'unsupported'
+        : await this.readSnapshotKeyboardVisibility(signal);
     if (this.backend === 'xctest') {
       const { acquireWebDriverIosSnapshot } = await import('./webdriver-ios-snapshot.ts');
       return acquireWebDriverIosSnapshot(source, this.targetId, visibility);
@@ -391,6 +416,10 @@ class WebDriverInteractor implements Interactor {
       await this.client.executeScript('mobile: pressKey', [
         { keycode: ANDROID_SYSTEM_BUTTON_KEYCODES.home },
       ]);
+      return;
+    }
+    if (this.routeProfile === 'wda' && this.backend === 'xctest') {
+      await this.client.wdaHome();
       return;
     }
     await this.client.executeScript('mobile: pressButton', [{ name: 'home' }]);

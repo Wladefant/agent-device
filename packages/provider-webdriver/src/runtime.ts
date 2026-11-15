@@ -27,7 +27,12 @@ import {
 } from './capabilities.ts';
 import { createWebDriverDeploymentRuntime } from './runtime-deployment.ts';
 import { WebDriverSessionManager } from './runtime-session.ts';
-import type { WebDriverAuth, WebDriverRequestPolicy } from './webdriver-client.ts';
+import type {
+  WebDriverAuth,
+  WebDriverRequestPolicy,
+  WebDriverRouteProfile,
+  WebDriverSessionOwnership,
+} from './webdriver-client.ts';
 
 export type CloudWebDriverPlatform = 'android' | 'ios';
 
@@ -59,6 +64,9 @@ export type CloudWebDriverBaseSession = {
   webdriverCapabilities: Record<string, unknown>;
   auth?: WebDriverAuth;
   headers?: Record<string, string>;
+  existingSessionId?: string;
+  sessionOwnership?: WebDriverSessionOwnership;
+  routeProfile?: WebDriverRouteProfile;
 };
 
 export type CloudWebDriverPreparedSession = CloudWebDriverBaseSession & {
@@ -96,6 +104,9 @@ export type CloudWebDriverRuntimeOptions = {
   auth?: WebDriverAuth;
   headers?: Record<string, string>;
   requestPolicy?: WebDriverRequestPolicy;
+  existingSessionId?: string;
+  sessionOwnership?: WebDriverSessionOwnership;
+  routeProfile?: WebDriverRouteProfile;
   uploadApp?: CloudWebDriverUploadApp;
   listArtifacts?: CloudWebDriverListArtifacts;
   deviceId?: (lease: DeviceLease) => string;
@@ -118,6 +129,7 @@ export function createCloudWebDriverRuntime(
 }
 
 export { buildCloudWebDriverBaseCapabilities } from './capabilities.ts';
+export type { WebDriverRouteProfile, WebDriverSessionOwnership } from './webdriver-client.ts';
 
 /** Public façade: provider wiring stays small while session/deployment mechanics stay focused. */
 class CloudWebDriverRuntimeImplementation implements CloudWebDriverRuntime {

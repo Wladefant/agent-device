@@ -31,6 +31,10 @@
     "./android-snapshot": {
       "types": "./src/webdriver-android-source.ts",
       "default": "./src/webdriver-android-source.ts"
+    },
+    "./wda-attach": {
+      "types": "./src/wda-attach.ts",
+      "default": "./src/wda-attach.ts"
     }
   },
   "devDependencies": {
