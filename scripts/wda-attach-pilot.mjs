@@ -1,42 +1,11 @@
 import fs from 'node:fs';
-import { registerHooks } from 'node:module';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { registerWdaWorkspaceHooks } from './wda-workspace-hooks.mjs';
+
+registerWdaWorkspaceHooks();
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const packagesDir = path.join(repoRoot, 'packages');
-const pkgExports = new Map();
-
-for (const dir of fs.readdirSync(packagesDir)) {
-  const pjPath = path.join(packagesDir, dir, 'package.json');
-  if (!fs.existsSync(pjPath)) continue;
-  const pj = JSON.parse(fs.readFileSync(pjPath, 'utf8'));
-  if (pj.name && pj.exports) {
-    pkgExports.set(pj.name, { root: path.join(packagesDir, dir), exports: pj.exports });
-  }
-}
-
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    if (specifier.startsWith('@agent-device/')) {
-      const parts = specifier.split('/');
-      const pkgName = parts.slice(0, 2).join('/');
-      const sub = parts.length > 2 ? `./${parts.slice(2).join('/')}` : '.';
-      const entry = pkgExports.get(pkgName);
-      if (entry) {
-        const exp = entry.exports[sub];
-        const target = typeof exp === 'string' ? exp : (exp?.default ?? exp?.types);
-        if (target) {
-          return {
-            shortCircuit: true,
-            url: pathToFileURL(path.resolve(entry.root, target)).href,
-          };
-        }
-      }
-    }
-    return nextResolve(specifier, context);
-  },
-});
 
 function parseArgs(argv) {
   const args = {};
@@ -71,17 +40,53 @@ if (!sessionId) {
   process.exit(2);
 }
 
+function parseFiniteNonNegativeCoord(name, raw) {
+  const trimmed = typeof raw === 'string' ? raw.trim() : '';
+  if (!trimmed) {
+    throw new Error(`--${name} must be a finite non-negative number.`);
+  }
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`--${name} must be a finite non-negative number; received "${raw}".`);
+  }
+  return value;
+}
+
+const hasTapLabel = args['tap-label'] !== undefined;
+const hasTapX = args['tap-x'] !== undefined;
+const hasTapY = args['tap-y'] !== undefined;
+if (hasTapLabel && (hasTapX || hasTapY)) {
+  console.error('Cannot combine --tap-label with --tap-x/--tap-y.');
+  process.exit(2);
+}
+if (hasTapX !== hasTapY) {
+  console.error('Both --tap-x and --tap-y must be provided together.');
+  process.exit(2);
+}
+
 let tap;
-if (args['tap-label']) {
+if (hasTapLabel) {
+  if (!args['tap-label'].trim()) {
+    console.error('--tap-label must not be empty.');
+    process.exit(2);
+  }
   tap = {
     kind: 'label',
     label: args['tap-label'],
     ...(args['tap-type'] ? { type: args['tap-type'] } : {}),
   };
-} else if (args['tap-x'] !== undefined && args['tap-y'] !== undefined) {
-  tap = { kind: 'point', x: Number(args['tap-x']), y: Number(args['tap-y']) };
+} else if (hasTapX && hasTapY) {
+  try {
+    tap = {
+      kind: 'point',
+      x: parseFiniteNonNegativeCoord('tap-x', args['tap-x']),
+      y: parseFiniteNonNegativeCoord('tap-y', args['tap-y']),
+    };
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(2);
+  }
 }
-
 // Static import hoists above registerHooks(), so load workspace TS entry after hook registration.
 const { runWdaAttachSequence } = await import('@agent-device/provider-webdriver/wda-attach');
 const result = await runWdaAttachSequence({

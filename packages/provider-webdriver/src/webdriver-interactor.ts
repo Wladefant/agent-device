@@ -133,6 +133,19 @@ class WebDriverInteractor implements Interactor {
     this.capabilities = capabilities;
     this.targetId = targetId;
     this.routeProfile = routeProfile;
+    if (this.client.hasGuardedWdaTap && (this.routeProfile !== 'wda' || this.backend !== 'xctest')) {
+      throw new AppError(
+        'INVALID_ARGS',
+        'guardedWdaTap requires routeProfile "wda" and xctest backend.',
+        {
+          reason: 'guarded_wda_incompatible_route_profile',
+          provider: this.capabilities.provider,
+          platform: this.capabilities.platform,
+          routeProfile: this.routeProfile,
+          backend: this.backend,
+        },
+      );
+    }
   }
 
   async open(
@@ -191,6 +204,7 @@ class WebDriverInteractor implements Interactor {
 
   async doubleTap(x: number, y: number): Promise<Record<string, unknown>> {
     this.requireSupport('doubleTap');
+    this.requireUnguardedPointerActions('doubleTap');
     await this.pointerGesture('doubleTap', [
       { type: 'pointerMove', duration: 0, x, y },
       { type: 'pointerDown', button: 0 },
@@ -210,6 +224,7 @@ class WebDriverInteractor implements Interactor {
     durationMs = 400,
   ): Promise<Record<string, unknown>> {
     this.requireSupport('swipe');
+    this.requireUnguardedPointerActions('swipe');
     await this.pointerGesture('swipe', [
       { type: 'pointerMove', duration: 0, x: x1, y: y1 },
       { type: 'pointerDown', button: 0 },
@@ -221,6 +236,7 @@ class WebDriverInteractor implements Interactor {
 
   async longPress(x: number, y: number, durationMs = 600): Promise<Record<string, unknown>> {
     this.requireSupport('longPress');
+    this.requireUnguardedPointerActions('longPress');
     await this.pointerGesture('longPress', [
       { type: 'pointerMove', duration: 0, x, y },
       { type: 'pointerDown', button: 0 },
@@ -263,6 +279,7 @@ class WebDriverInteractor implements Interactor {
     options?: { amount?: number; pixels?: number; durationMs?: number },
   ): Promise<Record<string, unknown>> {
     this.requireSupport('scroll');
+    this.requireUnguardedPointerActions('scroll');
     const durationMs = options?.durationMs ?? 350;
     await this.client.hideKeyboard().catch(() => undefined);
     const rect = await this.scrollGestureFrame();
@@ -296,6 +313,7 @@ class WebDriverInteractor implements Interactor {
 
   async performGesture(plan: GesturePlan): Promise<Record<string, unknown>> {
     this.requireSupport(webDriverOperationForGesture(plan));
+    this.requireUnguardedPointerActions(webDriverOperationForGesture(plan));
     await this.client.performActions(
       plan.pointers.map((pointer) =>
         touchPointer(`gesture-pointer-${pointer.pointerId}`, pointerActions(pointer.samples)),
@@ -717,6 +735,7 @@ class WebDriverInteractor implements Interactor {
   }
 
   private async pointerGesture(name: string, actions: W3CPointerAction[]): Promise<void> {
+    this.requireUnguardedPointerActions('swipe');
     await this.client.performActions([touchPointer(name, actions)]);
     // Some Appium grids accept W3C actions but reject DELETE /actions. A failed
     // best-effort input-state reset should not make the completed gesture fail.
@@ -739,6 +758,21 @@ class WebDriverInteractor implements Interactor {
   private requireSupport(operation: CloudWebDriverOperation): void {
     if (capabilitySupported(this.capabilities, operation)) return;
     this.unsupported(operation);
+  }
+
+  private requireUnguardedPointerActions(operation: CloudWebDriverOperation): void {
+    if (!this.client.hasGuardedWdaTap) return;
+    throw new AppError(
+      'UNSUPPORTED_OPERATION',
+      `${this.capabilities.provider} WebDriver runtime forbids ${operation} via unguarded W3C pointer actions when guardedWdaTap is enabled.`,
+      {
+        reason: 'guarded_wda_pointer_actions_forbidden',
+        provider: this.capabilities.provider,
+        platform: this.capabilities.platform,
+        operation,
+        dispatched: 'no',
+      },
+    );
   }
 
   private unsupported(operation: CloudWebDriverOperation): never {

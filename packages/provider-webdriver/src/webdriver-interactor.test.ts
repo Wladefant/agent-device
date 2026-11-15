@@ -969,3 +969,82 @@ test.each([true, false, 'failed'] as const)(
     );
   },
 );
+
+test('guardedWdaTap requires wda routeProfile and xctest backend and refuses unsupported pointer gestures', async () => {
+  let guardCalls = 0;
+  let actionCalls = 0;
+  let wdaTapCalls = 0;
+  const guardedClient = {
+    hasGuardedWdaTap: true,
+    wdaTap: async () => {
+      guardCalls += 1;
+      throw new Error('guard refused');
+    },
+    performActions: async () => {
+      actionCalls += 1;
+    },
+    releaseActions: async () => {},
+    hideKeyboard: async () => {},
+    source: async () => '<AppiumAUT />',
+    windowRect: async () => ({ x: 0, y: 0, width: 390, height: 844 }),
+  } as unknown as WebDriverClient;
+  const iosCaps = createCloudWebDriverCapabilities({ provider: 'wda-attach', platform: 'ios' });
+  const androidCaps = createCloudWebDriverCapabilities({
+    provider: 'wda-attach',
+    platform: 'android',
+  });
+
+  assert.throws(
+    () =>
+      createWebDriverInteractor({
+        client: guardedClient,
+        backend: 'xctest',
+        capabilities: iosCaps,
+        routeProfile: 'appium',
+      }),
+    (error: unknown) => error instanceof AppError && error.code === 'INVALID_ARGS',
+  );
+  assert.throws(
+    () =>
+      createWebDriverInteractor({
+        client: guardedClient,
+        backend: 'android',
+        capabilities: androidCaps,
+        routeProfile: 'wda',
+      }),
+    (error: unknown) => error instanceof AppError && error.code === 'INVALID_ARGS',
+  );
+
+  const interactor = createWebDriverInteractor({
+    client: guardedClient,
+    backend: 'xctest',
+    capabilities: iosCaps,
+    routeProfile: 'wda',
+  });
+
+  await assert.rejects(() => interactor.tap(10, 20), /guard refused/);
+  assert.equal(guardCalls, 1);
+
+  const plan = buildGesturePlan(
+    { intent: 'pan', origin: { x: 10, y: 10 }, delta: { x: 10, y: 10 }, durationMs: 100 },
+    { x: 0, y: 0, width: 390, height: 844 },
+  );
+  const swipeMethod =
+    'swipe' in interactor && typeof interactor.swipe === 'function'
+      ? () => (interactor.swipe as (...args: number[]) => Promise<unknown>)(10, 20, 30, 40)
+      : undefined;
+  for (const call of [
+    () => interactor.doubleTap!(10, 20),
+    () => interactor.longPress(10, 20),
+    ...(swipeMethod ? [swipeMethod] : []),
+    () => interactor.scroll('down'),
+    () => interactor.performGesture!(plan),
+  ]) {
+    await assert.rejects(
+      call,
+      (error: unknown) => error instanceof AppError && error.code === 'UNSUPPORTED_OPERATION',
+    );
+  }
+  assert.equal(actionCalls, 0);
+  assert.equal(wdaTapCalls, 0);
+});

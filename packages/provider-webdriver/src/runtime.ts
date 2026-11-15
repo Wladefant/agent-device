@@ -131,7 +131,12 @@ export function createCloudWebDriverRuntime(
 }
 
 export { buildCloudWebDriverBaseCapabilities } from './capabilities.ts';
-export type { WebDriverRouteProfile, WebDriverSessionOwnership } from './webdriver-client.ts';
+export type {
+  GuardedWdaTap,
+  GuardedWdaTapRequest,
+  WebDriverRouteProfile,
+  WebDriverSessionOwnership,
+} from './webdriver-client.ts';
 
 /** Public façade: provider wiring stays small while session/deployment mechanics stay focused. */
 class CloudWebDriverRuntimeImplementation implements CloudWebDriverRuntime {

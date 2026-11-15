@@ -3,6 +3,7 @@ import { AppError } from '@agent-device/kernel/errors';
 import {
   emitWebDriverDiagnostic,
   isWebDriverInvalidSession,
+  isWebDriverRequestTimeout,
   isWebDriverRouteUnsupported,
   WebDriverTransport,
   type WebDriverAuth,
@@ -19,12 +20,19 @@ export type { WebDriverAuth, WebDriverRequestPolicy } from './webdriver-transpor
  * suits a settled session's round trips.
  */
 const DEFAULT_SESSION_CREATE_TIMEOUT_MS = 180_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_ATTACH_PROBE_TIMEOUT_MS = 5_000;
 
-export type GuardedWdaTap = (request: {
+export type GuardedWdaTapRequest = {
   sessionId: string;
   x: number;
   y: number;
-}) => Promise<void>;
+  leaseId?: string;
+  deviceId?: string;
+  signal: AbortSignal;
+};
+
+export type GuardedWdaTap = (request: GuardedWdaTapRequest) => Promise<void>;
 
 export type WebDriverClientOptions = {
   clientVersion: string;
@@ -33,8 +41,8 @@ export type WebDriverClientOptions = {
   headers?: Record<string, string>;
   requestPolicy?: WebDriverRequestPolicy;
   guardedWdaTap?: GuardedWdaTap;
+  signal?: AbortSignal;
 };
-
 export type WebDriverSession = {
   sessionId: string;
   capabilities: Record<string, unknown>;
@@ -82,6 +90,8 @@ export type W3CActionSequence = {
 export class WebDriverClient {
   private readonly transport: WebDriverTransport;
   private readonly sessionCreateTimeoutMs: number;
+  private readonly defaultTimeoutMs: number;
+  private readonly defaultAbortSignal: AbortSignal | undefined;
   private sessionId: string | undefined;
   private sessionOwnership: WebDriverSessionOwnership = 'owned';
   private readonly guardedWdaTap: GuardedWdaTap | undefined;
@@ -89,8 +99,14 @@ export class WebDriverClient {
   constructor(options: WebDriverClientOptions) {
     this.transport = new WebDriverTransport(options);
     this.guardedWdaTap = options.guardedWdaTap;
+    this.defaultTimeoutMs = options.requestPolicy?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.defaultAbortSignal = options.signal;
     this.sessionCreateTimeoutMs =
       options.requestPolicy?.sessionCreateTimeoutMs ?? DEFAULT_SESSION_CREATE_TIMEOUT_MS;
+  }
+
+  get hasGuardedWdaTap(): boolean {
+    return this.guardedWdaTap !== undefined;
   }
 
   /**
@@ -131,6 +147,90 @@ export class WebDriverClient {
     this.sessionId = normalized;
     this.sessionOwnership = 'attached';
     return { sessionId: normalized, capabilities };
+  }
+
+  /**
+   * Verifies an attached WebDriver/WDA session with a bounded, non-mutating
+   * session-specific GET probe before publishing a live interactor.
+   */
+  async probeAttachedSession(options?: {
+    routeProfile?: WebDriverRouteProfile;
+    timeoutMs?: number;
+    deadline?: number;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    const sessionId = this.requireSessionId();
+    const baseBudgetMs = Math.min(
+      options?.timeoutMs ?? Math.min(this.defaultTimeoutMs, DEFAULT_ATTACH_PROBE_TIMEOUT_MS),
+      this.defaultTimeoutMs,
+    );
+    const deadline =
+      options?.deadline !== undefined
+        ? Math.min(options.deadline, Date.now() + baseBudgetMs)
+        : Date.now() + baseBudgetMs;
+    const signal = mergeAbortSignals(this.defaultAbortSignal, options?.signal);
+    if (signal?.aborted) {
+      throw new AppError(
+        'COMMAND_FAILED',
+        'Attached WebDriver session liveness probe aborted before dispatch.',
+        {
+          reason: 'webdriver_attached_session_probe_aborted',
+          sessionId,
+          dispatched: 'no',
+          retriable: false,
+        },
+        signal.reason,
+      );
+    }
+
+    const probeOverrides = (): WebDriverRequestOverrides => ({
+      retryAttempts: 0,
+      timeoutMs: remainingMs(deadline),
+      ...(signal === undefined ? {} : { signal }),
+    });
+
+    try {
+      if (options?.routeProfile === 'wda') {
+        try {
+          await this.wdaActiveAppInfo(probeOverrides());
+          return;
+        } catch (error) {
+          if (!isWebDriverRouteUnsupported(error)) throw error;
+        }
+      }
+      await this.sessionRequest('GET', '/window/rect', undefined, probeOverrides());
+    } catch (error) {
+      if (isWebDriverInvalidSession(error)) {
+        throw new AppError(
+          'SESSION_NOT_FOUND',
+          `Attached WebDriver session "${sessionId}" is invalid or no longer active.`,
+          { reason: 'webdriver_attached_session_invalid', sessionId, dispatched: 'no' },
+          error,
+        );
+      }
+      if (isWebDriverRequestTimeout(error)) {
+        throw new AppError(
+          'COMMAND_FAILED',
+          `Timed out probing attached WebDriver session "${sessionId}" within ${String(error.details?.timeoutMs ?? baseBudgetMs)}ms.`,
+          {
+            reason: 'webdriver_attached_session_probe_timeout',
+            sessionId,
+            timeoutMs: error.details?.timeoutMs ?? baseBudgetMs,
+            dispatched: 'no',
+          },
+          error,
+        );
+      }
+      if (isWebDriverRouteUnsupported(error)) {
+        throw new AppError(
+          'UNSUPPORTED_OPERATION',
+          `Attached WebDriver session "${sessionId}" liveness could not be verified because probe routes are unsupported.`,
+          { reason: 'webdriver_attached_session_probe_unsupported', sessionId, dispatched: 'no' },
+          error,
+        );
+      }
+      throw error;
+    }
   }
 
   /**
@@ -214,18 +314,60 @@ export class WebDriverClient {
     await this.requestValue('POST', '/wda/homescreen', {});
   }
 
-  async wdaTap(x: number, y: number): Promise<void> {
+  async wdaTap(
+    x: number,
+    y: number,
+    overrides?: { timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<void> {
+    const sessionId = this.requireSessionId();
+    const signal = mergeAbortSignals(this.defaultAbortSignal, overrides?.signal);
     if (this.guardedWdaTap) {
-      await this.guardedWdaTap({ sessionId: this.requireSessionId(), x, y });
+      const timeoutMs = overrides?.timeoutMs ?? this.defaultTimeoutMs;
+      if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+        throw new AppError('INVALID_ARGS', 'Guarded WDA tap timeoutMs must be finite and >= 0.', {
+          timeoutMs,
+        });
+      }
+      if (signal?.aborted) {
+        throw new AppError(
+          'COMMAND_FAILED',
+          'Guarded WDA tap aborted before dispatch.',
+          {
+            reason: 'webdriver_guarded_tap_aborted',
+            method: 'POST',
+            path: `/session/${sessionId}/wda/tap`,
+            dispatched: 'no',
+            retriable: false,
+          },
+          signal.reason,
+        );
+      }
+      await invokeGuardedWdaTapWithTimeout(this.guardedWdaTap, {
+        sessionId,
+        x,
+        y,
+        timeoutMs,
+        externalSignal: signal,
+      });
       return;
     }
-    await this.sessionRequest('POST', '/wda/tap', { x, y });
+    await this.sessionRequest('POST', '/wda/tap', { x, y }, {
+      ...overrides,
+      ...(signal === undefined ? {} : { signal }),
+      retryAttempts: 0,
+    });
   }
 
   async performActions(actions: W3CActionSequence[]): Promise<void> {
+    if (this.guardedWdaTap) {
+      throw new AppError(
+        'UNSUPPORTED_OPERATION',
+        'W3C pointer actions are forbidden when guardedWdaTap is enabled.',
+        { reason: 'guarded_wda_pointer_actions_forbidden', dispatched: 'no' },
+      );
+    }
     await this.sessionRequest('POST', '/actions', { actions });
   }
-
   async releaseActions(): Promise<void> {
     await this.sessionRequest('DELETE', '/actions');
   }
@@ -536,4 +678,98 @@ function readWebDriverErrorCode(error: AppError): string {
   const code =
     value && typeof value === 'object' ? (value as { error?: unknown }).error : undefined;
   return typeof code === 'string' ? code : '';
+}
+
+function mergeAbortSignals(
+  first: AbortSignal | undefined,
+  second: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (first && second) return AbortSignal.any([first, second]);
+  return first ?? second;
+}
+
+async function invokeGuardedWdaTapWithTimeout(
+  guard: GuardedWdaTap,
+  params: {
+    sessionId: string;
+    x: number;
+    y: number;
+    timeoutMs: number;
+    externalSignal: AbortSignal | undefined;
+  },
+): Promise<void> {
+  const { sessionId, x, y, timeoutMs, externalSignal } = params;
+  const controller = new AbortController();
+  let outcomeKind: 'settled' | 'timeout' | 'aborted' = 'settled';
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectAbort!: (error: unknown) => void;
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  // Suppress unhandled rejection if guard settles before abort fires.
+  void abortPromise.catch(() => undefined);
+
+  const abortPath = `/session/${sessionId}/wda/tap`;
+  const onTimeout = () => {
+    if (outcomeKind !== 'settled') return;
+    outcomeKind = 'timeout';
+    const err = new AppError(
+      'COMMAND_FAILED',
+      `Guarded WDA tap timed out after ${String(timeoutMs)}ms.`,
+      {
+        reason: 'webdriver_guarded_tap_timeout',
+        method: 'POST',
+        path: abortPath,
+        timeoutMs,
+        dispatched: 'unknown',
+        retriable: false,
+      },
+    );
+    controller.abort(err);
+    rejectAbort(err);
+  };
+  const onExternalAbort = () => {
+    if (outcomeKind !== 'settled') return;
+    outcomeKind = 'aborted';
+    const err = new AppError(
+      'COMMAND_FAILED',
+      'Guarded WDA tap aborted while waiting for owner guard.',
+      {
+        reason: 'webdriver_guarded_tap_aborted',
+        method: 'POST',
+        path: abortPath,
+        dispatched: 'unknown',
+        retriable: false,
+      },
+      externalSignal?.reason,
+    );
+    controller.abort(err);
+    rejectAbort(err);
+  };
+
+  if (externalSignal) {
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  timer = setTimeout(onTimeout, timeoutMs);
+  timer.unref?.();
+
+  const guardPromise = Promise.resolve(
+    guard({
+      sessionId,
+      x,
+      y,
+      signal: controller.signal,
+    }),
+  );
+  // If the race settles on timeout/abort first, a late rejection from an orphaned guard must not crash.
+  void guardPromise.catch(() => undefined);
+
+  try {
+    await Promise.race([guardPromise, abortPromise]);
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal) {
+      externalSignal.removeEventListener('abort', onExternalAbort);
+    }
+  }
 }

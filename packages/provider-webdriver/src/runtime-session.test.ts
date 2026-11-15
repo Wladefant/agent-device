@@ -133,6 +133,171 @@ test('cloud artifact lookup does not accept a provider session id without its le
   }
 });
 
+test('rejects sessionOwnership=attached without existingSessionId before POST /session and runs cleanup', async () => {
+  let fetchCalls = 0;
+  let cleanupCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return jsonResponse({ sessionId: 'should-not-create', capabilities: {} });
+  };
+  const runtime = makeRuntime({
+    sessionOwnership: 'attached',
+    prepareSession: async ({ base }) => ({
+      ...base,
+      cleanup: async () => {
+        cleanupCalls += 1;
+        return undefined;
+      },
+    }),
+  });
+
+  try {
+    await assert.rejects(
+      () => runtime.leaseLifecycle.allocate!(makeLease()),
+      (error: unknown) => {
+        assert.ok(error instanceof AppError);
+        assert.equal(error.code, 'INVALID_ARGS');
+        return true;
+      },
+    );
+    assert.equal(fetchCalls, 0);
+    assert.equal(cleanupCalls, 1);
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
+test('created session is always owned and sends DELETE /session/{id} on release', async () => {
+  const requests: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const method = init?.method ?? new Request(input as RequestInfo).method;
+    const pathname = new URL(String(input instanceof Request ? input.url : input)).pathname;
+    requests.push(`${method} ${pathname}`);
+    if (method === 'POST' && pathname.endsWith('/session')) {
+      return jsonResponse({ value: { sessionId: 'created-1', capabilities: {} } });
+    }
+    if (method === 'DELETE' && pathname.endsWith('/session/created-1')) {
+      return jsonResponse({ value: null });
+    }
+    return jsonResponse({ value: null });
+  };
+  const runtime = makeRuntime();
+  const lease = makeLease();
+
+  try {
+    await runtime.leaseLifecycle.allocate!(lease);
+    await runtime.leaseLifecycle.release!(lease);
+  } finally {
+    await runtime.shutdown();
+  }
+
+  assert.deepEqual(requests, ['POST /wd/hub/session', 'DELETE /wd/hub/session/created-1']);
+});
+
+test('rejects guardedWdaTap with unguarded routeProfile or non-ios platform before create', async () => {
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return jsonResponse({ value: { sessionId: 'unexpected', capabilities: {} } });
+  };
+
+  assert.throws(
+    () =>
+      makeRuntime({
+        platform: 'ios',
+        routeProfile: 'appium',
+        guardedWdaTap: async () => {},
+      }),
+    (error: unknown) => error instanceof AppError && error.code === 'INVALID_ARGS',
+  );
+
+  assert.throws(
+    () =>
+      makeRuntime({
+        platform: 'android',
+        routeProfile: 'wda',
+        guardedWdaTap: async () => {},
+      }),
+    (error: unknown) => error instanceof AppError && error.code === 'INVALID_ARGS',
+  );
+
+  const dynamicRuntime = makeRuntime({
+    platform: 'ios',
+    routeProfile: 'wda',
+    guardedWdaTap: async () => {},
+    prepareSession: async ({ base }) => ({ ...base, routeProfile: 'appium' }),
+  });
+  try {
+    await assert.rejects(
+      () => dynamicRuntime.leaseLifecycle.allocate!(makeLease()),
+      (error: unknown) => error instanceof AppError && error.code === 'INVALID_ARGS',
+    );
+    assert.equal(fetchCalls, 0);
+  } finally {
+    await dynamicRuntime.shutdown();
+  }
+});
+
+test('enforces single active attached lease across concurrent allocations and allows post-release reallocation', async () => {
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input instanceof Request ? input.url : input)).pathname;
+    if (pathname.endsWith('/wda/activeAppInfo')) {
+      return jsonResponse({ value: { bundleId: 'com.example.app' } });
+    }
+    return jsonResponse({ value: { message: 'unexpected' } }, 404);
+  };
+  const guardedLeaseIds: string[] = [];
+  const runtime = makeRuntime({
+    platform: 'ios',
+    routeProfile: 'wda',
+    existingSessionId: 'SESS-SHARED',
+    sessionOwnership: 'attached',
+    deviceId: () => 'UDID-SHARED',
+    guardedWdaTap: async (request) => {
+      if (request.leaseId) guardedLeaseIds.push(request.leaseId);
+    },
+  });
+  const leaseA = { ...makeLease(), leaseId: 'lease-a' };
+  const leaseB = { ...makeLease(), leaseId: 'lease-b' };
+  const device = {
+    platform: 'apple' as const,
+    target: 'mobile' as const,
+    appleOs: 'ios' as const,
+    id: 'UDID-SHARED',
+    name: 'Attached iOS',
+    kind: 'device' as const,
+    booted: true,
+  };
+
+  try {
+    const [resA, resB] = await Promise.allSettled([
+      runtime.leaseLifecycle.allocate!(leaseA),
+      runtime.leaseLifecycle.allocate!(leaseB),
+    ]);
+    const fulfilled = [resA, resB].filter((r) => r.status === 'fulfilled');
+    const rejected = [resA, resB].filter((r) => r.status === 'rejected');
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.ok(rejected[0]!.reason instanceof AppError);
+    assert.equal((rejected[0]!.reason as AppError).code, 'DEVICE_IN_USE');
+
+    const winnerLease = resA.status === 'fulfilled' ? leaseA : leaseB;
+    const loserLease = resA.status === 'fulfilled' ? leaseB : leaseA;
+    await assert.rejects(
+      () => runtime.leaseLifecycle.allocate!(loserLease),
+      (error: unknown) => error instanceof AppError && error.code === 'DEVICE_IN_USE',
+    );
+    await runtime.getInteractor(device)!.tap(10, 20);
+    await runtime.leaseLifecycle.release!(winnerLease);
+
+    await runtime.leaseLifecycle.allocate!(loserLease);
+    await runtime.getInteractor(device)!.tap(30, 40);
+    assert.deepEqual(guardedLeaseIds, [winnerLease.leaseId, loserLease.leaseId]);
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
 function makeRuntime(overrides: Partial<CloudWebDriverRuntimeOptions> = {}) {
   return createCloudWebDriverRuntime({
     clientVersion: 'test',

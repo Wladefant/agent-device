@@ -10,14 +10,18 @@ import { PROVIDER_PROFILE_FIELD_FLAGS } from '@agent-device/contracts/remote';
 import { presentIosSnapshotAcquisition } from '@agent-device/capture-kit/ios-snapshot-runtime';
 import type { DeviceInfo } from '@agent-device/kernel/device';
 import { AppError } from '@agent-device/kernel/errors';
+import { isPositiveFiniteRect } from '@agent-device/kernel/rect';
 import type { SnapshotNode } from '@agent-device/kernel/snapshot';
 import { createCloudWebDriverRuntime, type CloudWebDriverRuntime } from './runtime.ts';
 import {
   WebDriverClient,
   type GuardedWdaTap,
+  type GuardedWdaTapRequest,
   type WebDriverRequestPolicy,
 } from './webdriver-client.ts';
+import { acquireWebDriverIosSnapshot } from './webdriver-ios-snapshot.ts';
 
+export type { GuardedWdaTap, GuardedWdaTapRequest };
 const WDA_ATTACH_PROVIDER = 'wda-attach';
 
 const WDA_ATTACH_PROFILE_FIELDS: ProviderProfileFieldDeclaration = {
@@ -55,6 +59,7 @@ export type WdaAttachSequenceOptions = Readonly<{
   tap?: WdaAttachTapSpec;
   dryRun?: boolean;
   requestPolicy?: WebDriverRequestPolicy;
+  guardedWdaTap?: GuardedWdaTap;
 }>;
 
 export type WdaAttachSequenceResult = Readonly<{
@@ -136,39 +141,122 @@ function readBundleInfo(value: Record<string, unknown>): {
   };
 }
 
-function resolveTapPoint(
-  nodes: readonly SnapshotNode[],
+function assertValidPointTapCoordinates(x: number, y: number): void {
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
+    throw new AppError(
+      'INVALID_ARGS',
+      'WDA tap coordinates must be finite non-negative numbers.',
+      { reason: 'invalid_tap_coordinates', x, y },
+    );
+  }
+}
+
+function resolveVerifiedTapTarget(
+  snapshotResult: SnapshotResult,
   tap: WdaAttachTapSpec,
 ): { targetRef?: string; targetLabel?: string; x: number; y: number } {
+  const viewport = snapshotResult.viewport;
+  if (
+    !viewport ||
+    !Number.isFinite(viewport.width) ||
+    !Number.isFinite(viewport.height) ||
+    viewport.width <= 0 ||
+    viewport.height <= 0
+  ) {
+    throw new AppError(
+      'COMMAND_FAILED',
+      'WDA snapshot did not provide a valid viewport for tap validation.',
+      { reason: 'missing_viewport' },
+    );
+  }
   if (tap.kind === 'point') {
+    assertValidPointTapCoordinates(tap.x, tap.y);
+    if (tap.x >= viewport.width || tap.y >= viewport.height) {
+      throw new AppError(
+        'INVALID_ARGS',
+        `Tap point (${tap.x}, ${tap.y}) is outside viewport ${viewport.width}x${viewport.height}.`,
+        { reason: 'tap_out_of_bounds', x: tap.x, y: tap.y, viewport },
+      );
+    }
     return { x: tap.x, y: tap.y };
   }
-  const match = nodes.find(
-    (node) =>
-      node.label === tap.label &&
-      (tap.type === undefined || node.type === tap.type) &&
-      node.rect !== undefined &&
-      node.rect.width > 0 &&
-      node.rect.height > 0,
+
+  const nodes = snapshotResult.nodes ?? [];
+  const candidates = nodes.filter(
+    (node) => node.label === tap.label && (tap.type === undefined || node.type === tap.type),
   );
-  if (!match?.rect) {
+  if (candidates.length === 0) {
     throw new AppError(
       'COMMAND_FAILED',
       `Could not resolve interactive snapshot target "${tap.label}" with valid rect.`,
-      { label: tap.label, type: tap.type, nodeCount: nodes.length },
+      { reason: 'tap_target_not_found', label: tap.label, type: tap.type, nodeCount: nodes.length },
     );
   }
+
+  const actionable = candidates.flatMap((node) => {
+    if (!isPositiveFiniteRect(node.rect)) return [];
+    if (node.enabled !== true || node.visibleToUser !== true) return [];
+    if (node.hittable === false || node.interactionBlocked === 'covered') return [];
+    const x = Math.round(node.rect.x + node.rect.width / 2);
+    const y = Math.round(node.rect.y + node.rect.height / 2);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return [];
+    if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) return [];
+    return [{ node, x, y }];
+  });
+
+  if (actionable.length > 1) {
+    throw new AppError(
+      'AMBIGUOUS_MATCH',
+      `Multiple visible enabled targets matched label "${tap.label}".`,
+      {
+        reason: 'ambiguous_tap_target',
+        label: tap.label,
+        type: tap.type,
+        matchCount: actionable.length,
+      },
+    );
+  }
+  if (actionable.length === 0) {
+    throw new AppError(
+      'COMMAND_FAILED',
+      `Target "${tap.label}" is not visible, enabled, and within viewport bounds.`,
+      {
+        reason: 'tap_target_not_actionable',
+        label: tap.label,
+        type: tap.type,
+        candidateCount: candidates.length,
+      },
+    );
+  }
+  const match = actionable[0]!;
   return {
-    targetRef: match.ref,
-    targetLabel: match.label,
-    x: Math.round(match.rect.x + match.rect.width / 2),
-    y: Math.round(match.rect.y + match.rect.height / 2),
+    targetRef: match.node.ref,
+    targetLabel: match.node.label,
+    x: match.x,
+    y: match.y,
   };
 }
 
 export async function runWdaAttachSequence(
   options: WdaAttachSequenceOptions,
 ): Promise<WdaAttachSequenceResult> {
+  if (options.tap) {
+    if (!options.dryRun && !options.guardedWdaTap) {
+      throw new AppError(
+        'INVALID_ARGS',
+        'WDA attach sequence tap requires guardedWdaTap unless dryRun is true.',
+        { reason: 'wda_tap_guard_required' },
+      );
+    }
+    if (options.tap.kind === 'point') {
+      assertValidPointTapCoordinates(options.tap.x, options.tap.y);
+    } else if (!options.tap.label.trim()) {
+      throw new AppError('INVALID_ARGS', 'WDA tap label must not be empty.', {
+        reason: 'invalid_tap_target',
+      });
+    }
+  }
+
   const endpointStr = String(options.endpoint);
   const probeClient = new WebDriverClient({
     clientVersion: '0.21.38-wda-attach-pilot',
@@ -193,12 +281,63 @@ export async function runWdaAttachSequence(
     );
   }
 
+  const callerGuard = options.guardedWdaTap;
+  const dispatchGuardedWdaTap: GuardedWdaTap | undefined = callerGuard
+    ? async (request) => {
+        if (options.expectedBundleId) {
+          const activeApp = readBundleInfo(
+            await probeClient.wdaActiveAppInfo({ retryAttempts: 0, signal: request.signal }),
+          );
+          if (activeApp.bundleId !== options.expectedBundleId) {
+            throw new AppError(
+              'COMMAND_FAILED',
+              `Foreground app mismatch before WDA tap: expected ${options.expectedBundleId}, got ${activeApp.bundleId ?? 'unknown'}.`,
+              {
+                reason: 'wda_foreground_app_mismatch',
+                expectedBundleId: options.expectedBundleId,
+                actualBundleId: activeApp.bundleId,
+                dispatched: 'no',
+              },
+            );
+          }
+        }
+        if (options.tap) {
+          const freshSource = await probeClient.source({
+            retryAttempts: 0,
+            signal: request.signal,
+          });
+          const freshSnapshot = presentIosSnapshotAcquisition(
+            acquireWebDriverIosSnapshot(freshSource, options.udid, 'unsupported'),
+            { interactiveOnly: true },
+          );
+          const freshTarget = resolveVerifiedTapTarget(freshSnapshot, options.tap);
+          if (
+            Math.abs(freshTarget.x - request.x) > 1 ||
+            Math.abs(freshTarget.y - request.y) > 1
+          ) {
+            throw new AppError(
+              'COMMAND_FAILED',
+              `Tap target shifted before WDA dispatch: expected (${request.x}, ${request.y}), got (${freshTarget.x}, ${freshTarget.y}).`,
+              {
+                reason: 'wda_tap_target_shifted',
+                expected: { x: request.x, y: request.y },
+                actual: { x: freshTarget.x, y: freshTarget.y },
+                dispatched: 'no',
+              },
+            );
+          }
+        }
+        await callerGuard(request);
+      }
+    : undefined;
+
   const runtime = createWdaAttachRuntime({
     endpoint: options.endpoint,
     sessionId: options.sessionId,
     udid: options.udid,
     deviceName: options.deviceName,
     requestPolicy: options.requestPolicy,
+    guardedWdaTap: dispatchGuardedWdaTap,
   });
 
   const lease: DeviceLease = {
@@ -269,7 +408,7 @@ export async function runWdaAttachSequence(
     screenshotBytes = (await fs.stat(options.screenshotPath)).size;
 
     if (options.tap) {
-      const target = resolveTapPoint(snapshotNodes, options.tap);
+      const target = resolveVerifiedTapTarget(snapshotResult, options.tap);
       if (options.dryRun) {
         tapResult = { executed: false, ...target };
       } else {

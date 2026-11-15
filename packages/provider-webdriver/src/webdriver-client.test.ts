@@ -531,3 +531,162 @@ test('windowRect honors a bounded single-attempt probe and forwards cancellation
     vi.useRealTimers();
   }
 });
+
+test('performActions is refused without HTTP dispatch when guardedWdaTap is configured', async () => {
+  let fetchCalls = 0;
+  const client = new WebDriverClient({
+    clientVersion: '0.0.0-test',
+    endpoint: 'http://cloud-webdriver.test/wd/hub/',
+    guardedWdaTap: async () => {},
+  });
+  client.attachSession('SESS-1');
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return new Response(JSON.stringify({ value: null }), { status: 200 });
+  };
+
+  await assert.rejects(
+    () =>
+      client.performActions([
+        {
+          type: 'pointer',
+          id: 'touch',
+          parameters: { pointerType: 'touch' },
+          actions: [{ type: 'pointerMove', duration: 0, x: 10, y: 20 }],
+        },
+      ]),
+    (error: unknown) => error instanceof AppError && error.code === 'UNSUPPORTED_OPERATION',
+  );
+  assert.equal(fetchCalls, 0);
+});
+
+test('probeAttachedSession rejects invalid session id, timeout, and unsupported routes, and falls back from activeAppInfo to window/rect', async () => {
+  const makeAttached = () => {
+    const c = new WebDriverClient({
+      clientVersion: '0.0.0-test',
+      endpoint: 'http://cloud-webdriver.test/wd/hub/',
+      requestPolicy: { timeoutMs: 40, retryAttempts: 2 },
+    });
+    c.attachSession('SESS-1');
+    return c;
+  };
+
+  // Stale session id -> SESSION_NOT_FOUND
+  globalThis.fetch = webDriverResponse(404, {
+    value: { error: 'invalid session id', message: 'Session does not exist' },
+  });
+  await assert.rejects(
+    () => makeAttached().probeAttachedSession({ routeProfile: 'wda' }),
+    (error: unknown) =>
+      error instanceof AppError &&
+      error.code === 'SESSION_NOT_FOUND' &&
+      error.details?.reason === 'webdriver_attached_session_invalid',
+  );
+
+  // Unsupported activeAppInfo falls back to valid /window/rect
+  let probePaths: string[] = [];
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input instanceof Request ? input.url : input)).pathname;
+    probePaths.push(pathname);
+    if (pathname.endsWith('/wda/activeAppInfo')) {
+      return new Response(
+        JSON.stringify({ value: { error: 'unknown command', message: 'No activeAppInfo' } }),
+        { status: 404, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    return new Response(JSON.stringify({ value: { x: 0, y: 0, width: 390, height: 844 } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  await makeAttached().probeAttachedSession({ routeProfile: 'wda' });
+  assert.deepEqual(probePaths, [
+    '/wd/hub/session/SESS-1/wda/activeAppInfo',
+    '/wd/hub/session/SESS-1/window/rect',
+  ]);
+
+  // Unsupported on both routes -> UNSUPPORTED_OPERATION
+  globalThis.fetch = webDriverResponse(404, {
+    value: { error: 'unknown command', message: 'Unknown command' },
+  });
+  await assert.rejects(
+    () => makeAttached().probeAttachedSession({ routeProfile: 'wda' }),
+    (error: unknown) => error instanceof AppError && error.code === 'UNSUPPORTED_OPERATION',
+  );
+
+  // Timeout -> bounded and non-retried
+  vi.useFakeTimers();
+  try {
+    let calls = 0;
+    globalThis.fetch = async (_input, init) => {
+      calls += 1;
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason as Error));
+      });
+    };
+    const pending = assert.rejects(
+      () => makeAttached().probeAttachedSession({ routeProfile: 'wda', timeoutMs: 30 }),
+      (error: unknown) =>
+        error instanceof AppError &&
+        error.details?.reason === 'webdriver_attached_session_probe_timeout',
+    );
+    await vi.advanceTimersByTimeAsync(30);
+    await pending;
+    assert.equal(calls, 1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('wdaTap bounds never-settling guardedWdaTap by requestPolicy.timeoutMs, aborts signal, and never retries', async () => {
+  vi.useFakeTimers();
+  try {
+    let guardCalls = 0;
+    let guardSignal: AbortSignal | undefined;
+    let fetchCalls = 0;
+    globalThis.fetch = async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({ value: null }), { status: 200 });
+    };
+
+    const client = new WebDriverClient({
+      clientVersion: '0.0.0-test',
+      endpoint: 'http://cloud-webdriver.test/wd/hub/',
+      requestPolicy: { timeoutMs: 40, retryAttempts: 3 },
+      guardedWdaTap: async (request) => {
+        guardCalls += 1;
+        guardSignal = request.signal;
+        return await new Promise<void>(() => {});
+      },
+    });
+    client.attachSession('SESS-1');
+
+    const pending = assert.rejects(
+      () => client.wdaTap(10, 20),
+      (error: unknown) =>
+        error instanceof AppError &&
+        error.details?.reason === 'webdriver_guarded_tap_timeout' &&
+        error.details?.dispatched === 'unknown' &&
+        error.details?.retriable === false,
+    );
+    await vi.advanceTimersByTimeAsync(40);
+    await pending;
+    assert.equal(guardCalls, 1);
+    assert.equal(guardSignal?.aborted, true);
+    assert.equal(fetchCalls, 0);
+
+    // Pre-aborted signal never invokes guard and reports dispatched: 'no'.
+    const controller = new AbortController();
+    controller.abort(new Error('cancelled early'));
+    await assert.rejects(
+      () => client.wdaTap(10, 20, { signal: controller.signal }),
+      (error: unknown) =>
+        error instanceof AppError &&
+        error.details?.dispatched === 'no' &&
+        error.details?.retriable === false,
+    );
+    assert.equal(guardCalls, 1);
+  } finally {
+    vi.useRealTimers();
+  }
+});

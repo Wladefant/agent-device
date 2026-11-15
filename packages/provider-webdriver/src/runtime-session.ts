@@ -65,6 +65,12 @@ type WebDriverLeaseEntry = {
   session: WebDriverProviderSession | undefined;
   /** Which route took this lease from its allocation, and the one disposal that owns its session. */
   taken: WebDriverLeaseTake | undefined;
+  /** Lease-scoped cancellation signal aborted when release/shutdown takes this entry. */
+  abortController: AbortController;
+  /** Exclusive attached WDA session id claimed by this entry while active/allocating. */
+  claimedAttachedSessionId?: string;
+  /** Exclusive device id claimed by this entry while active/allocating. */
+  claimedDeviceId?: string;
 };
 
 /**
@@ -116,12 +122,30 @@ export class WebDriverSessionManager {
   private readonly entriesByLeaseId = new Map<string, WebDriverLeaseEntry>();
   private readonly ownedDeviceIds = new Set<string>();
   private readonly releasedProviderSessionIdsByLeaseId = new Map<string, string>();
+  private readonly activeAttachedSessions = new Map<string, string>();
+  private readonly activeDeviceLeases = new Map<string, string>();
   private readonly options: CloudWebDriverRuntimeOptions;
   /** Whether this manager has shut down; it can then hold nothing, so it must create nothing. */
   private shutDown = false;
 
   constructor(options: CloudWebDriverRuntimeOptions) {
     this.options = options;
+    if (
+      !options.prepareSession &&
+      options.guardedWdaTap !== undefined &&
+      (options.routeProfile !== 'wda' || options.platform !== 'ios')
+    ) {
+      throw new AppError(
+        'INVALID_ARGS',
+        'guardedWdaTap requires routeProfile "wda" and platform "ios".',
+        {
+          reason: 'guarded_wda_incompatible_route_profile',
+          provider: options.provider,
+          platform: options.platform,
+          routeProfile: options.routeProfile ?? 'appium',
+        },
+      );
+    }
   }
 
   ownsDevice(device: DeviceInfo): boolean {
@@ -261,11 +285,17 @@ export class WebDriverSessionManager {
       rentSession = rent;
       refuseSession = refuse;
     });
-    const entry: WebDriverLeaseEntry = { lease, creation, session: undefined, taken: undefined };
+    const entry: WebDriverLeaseEntry = {
+      lease,
+      creation,
+      session: undefined,
+      taken: undefined,
+      abortController: new AbortController(),
+    };
     this.entriesByLeaseId.set(lease.leaseId, entry);
     // Started after the publication above, so the create's answer can never arrive without an entry
     // beside it. Whichever route took the entry in the meantime disposes the session this answers.
-    void this.createSessionForLease(lease, req).then(
+    void this.createSessionForLease(lease, req, entry).then(
       (session) => {
         entry.session = session;
         this.ownedDeviceIds.add(session.device.id);
@@ -274,6 +304,7 @@ export class WebDriverSessionManager {
       (error: unknown) => {
         // The create billed nothing and gave back what its preparation rented, so the lease is free
         // again as soon as nobody is left to dispose anything for it.
+        this.releaseLeaseClaims(entry);
         if (entry.taken === undefined && this.entriesByLeaseId.get(lease.leaseId) === entry) {
           this.entriesByLeaseId.delete(lease.leaseId);
         }
@@ -292,19 +323,113 @@ export class WebDriverSessionManager {
   private async createSessionForLease(
     lease: DeviceLease,
     req: LeaseLifecycleContext | undefined,
+    entry: WebDriverLeaseEntry,
   ): Promise<WebDriverProviderSession> {
     await this.rejectRefusedProfileFields(req);
     const prepared = await this.prepareSession(lease, req);
+    const device = this.deviceForLease(lease, prepared);
+    try {
+      if (
+        this.options.guardedWdaTap !== undefined &&
+        (prepared.routeProfile !== 'wda' || snapshotBackendForPlatform(prepared.platform) !== 'xctest')
+      ) {
+        throw new AppError(
+          'INVALID_ARGS',
+          'guardedWdaTap requires routeProfile "wda" and platform "ios".',
+          {
+            reason: 'guarded_wda_incompatible_route_profile',
+            provider: this.options.provider,
+            platform: prepared.platform,
+            routeProfile: prepared.routeProfile ?? 'appium',
+          },
+        );
+      }
+      if (prepared.existingSessionId === undefined && prepared.sessionOwnership === 'attached') {
+        throw new AppError(
+          'INVALID_ARGS',
+          'sessionOwnership: "attached" requires existingSessionId.',
+        );
+      }
+      if (prepared.existingSessionId !== undefined && prepared.sessionOwnership === 'owned') {
+        throw new AppError(
+          'INVALID_ARGS',
+          'existingSessionId cannot be combined with sessionOwnership: "owned".',
+        );
+      }
+      if (prepared.existingSessionId !== undefined && !prepared.existingSessionId.trim()) {
+        throw new AppError('INVALID_ARGS', 'Existing WebDriver sessionId must not be empty.');
+      }
+
+      // Synchronous single-owner claim (no await between check and set).
+      const deviceOwner = this.activeDeviceLeases.get(device.id);
+      if (deviceOwner !== undefined && deviceOwner !== lease.leaseId) {
+        throw new AppError(
+          'DEVICE_IN_USE',
+          `${this.options.provider} device ${device.id} is already leased to ${deviceOwner}.`,
+          {
+            reason: 'device_in_use',
+            provider: this.options.provider,
+            deviceId: device.id,
+            activeLeaseId: deviceOwner,
+            leaseId: lease.leaseId,
+          },
+        );
+      }
+      if (prepared.existingSessionId !== undefined) {
+        const attachedSessionId = prepared.existingSessionId.trim();
+        const sessionOwner = this.activeAttachedSessions.get(attachedSessionId);
+        if (sessionOwner !== undefined && sessionOwner !== lease.leaseId) {
+          throw new AppError(
+            'DEVICE_IN_USE',
+            `${this.options.provider} WebDriver session ${attachedSessionId} is already leased to ${sessionOwner}.`,
+            {
+              reason: 'webdriver_session_in_use',
+              provider: this.options.provider,
+              sessionId: attachedSessionId,
+              activeLeaseId: sessionOwner,
+              leaseId: lease.leaseId,
+            },
+          );
+        }
+        this.activeAttachedSessions.set(attachedSessionId, lease.leaseId);
+        entry.claimedAttachedSessionId = attachedSessionId;
+      }
+      this.activeDeviceLeases.set(device.id, lease.leaseId);
+      entry.claimedDeviceId = device.id;
+    } catch (error) {
+      this.releaseLeaseClaims(entry);
+      await releaseOnFailure(error, () =>
+        this.providerCallback(`${this.options.provider} cleanup for lease ${lease.leaseId}`, () =>
+          prepared.cleanup?.(),
+        ),
+      );
+      throw error;
+    }
+
+    const guardedWdaTap = this.options.guardedWdaTap;
     const client = new WebDriverClient({
       clientVersion: this.options.clientVersion,
       endpoint: prepared.endpoint,
       auth: prepared.auth,
       headers: prepared.headers,
       requestPolicy: this.options.requestPolicy,
-      guardedWdaTap: this.options.guardedWdaTap,
+      signal: entry.abortController.signal,
+      guardedWdaTap: guardedWdaTap
+        ? async (request) =>
+            await guardedWdaTap({
+              ...request,
+              leaseId: lease.leaseId,
+              deviceId: device.id,
+            })
+        : undefined,
     });
-    const session = await this.createSessionWithPreparedCleanup(client, prepared, lease, req);
-    const device = this.deviceForLease(lease, prepared);
+    let session: WebDriverSession;
+    try {
+      session = await this.createSessionWithPreparedCleanup(client, prepared, lease, req);
+    } catch (error) {
+      this.releaseLeaseClaims(entry);
+      throw error;
+    }
     const capabilities = createCloudWebDriverCapabilities({
       provider: this.options.provider,
       platform: prepared.platform,
@@ -318,10 +443,7 @@ export class WebDriverSessionManager {
       capabilities,
       webDriverSessionId: session.sessionId,
       providerSessionId: prepared.providerSessionId ?? session.sessionId,
-      sessionOwnership:
-        prepared.existingSessionId !== undefined
-          ? 'attached'
-          : (prepared.sessionOwnership ?? 'owned'),
+      sessionOwnership: prepared.existingSessionId !== undefined ? 'attached' : 'owned',
       interactor: createWebDriverInteractor({
         client,
         backend: snapshotBackendForPlatform(prepared.platform),
@@ -353,6 +475,20 @@ export class WebDriverSessionManager {
       artifacts: undefined,
     };
     entry.taken = take;
+    entry.abortController.abort(
+      new AppError(
+        'COMMAND_FAILED',
+        `${this.options.provider} lease ${entry.lease.leaseId} aborted by ${by}.`,
+        {
+          reason:
+            by === 'release'
+              ? 'provider_session_released_during_operation'
+              : 'provider_session_shutdown_during_operation',
+          dispatched: 'unknown',
+          retriable: false,
+        },
+      ),
+    );
     const settle = (outcome: WebDriverDisposalOutcome): void => {
       take.settled = outcome;
       take.providerSessionId = outcome.session?.providerSessionId;
@@ -365,8 +501,12 @@ export class WebDriverSessionManager {
           : this.safeListArtifacts(outcome.session, true).catch(() => undefined);
       // Whatever the create rented is now ended, or was never rented, so this entry owns nothing and the
       // lease is free again.
+      this.releaseLeaseClaims(entry);
       if (this.entriesByLeaseId.get(entry.lease.leaseId) === entry) {
         this.entriesByLeaseId.delete(entry.lease.leaseId);
+      }
+      if (outcome.session && !this.findSessionForDevice(outcome.session.device)) {
+        this.ownedDeviceIds.delete(outcome.session.device.id);
       }
       reportDisposal(outcome);
     };
@@ -506,7 +646,15 @@ export class WebDriverSessionManager {
             'existingSessionId cannot be combined with sessionOwnership: "owned".',
           );
         }
-        return client.attachSession(prepared.existingSessionId, prepared.webdriverCapabilities);
+        const session = client.attachSession(
+          prepared.existingSessionId,
+          prepared.webdriverCapabilities,
+        );
+        await client.probeAttachedSession({
+          routeProfile: prepared.routeProfile,
+          deadline: req?.deadline,
+        });
+        return session;
       }
       return await client.createSession(prepared.webdriverCapabilities, {
         deadline: req?.deadline,
@@ -635,6 +783,21 @@ export class WebDriverSessionManager {
         providerSessionId: session.providerSessionId,
         error,
       });
+    }
+  }
+
+  private releaseLeaseClaims(entry: WebDriverLeaseEntry): void {
+    if (
+      entry.claimedAttachedSessionId !== undefined &&
+      this.activeAttachedSessions.get(entry.claimedAttachedSessionId) === entry.lease.leaseId
+    ) {
+      this.activeAttachedSessions.delete(entry.claimedAttachedSessionId);
+    }
+    if (
+      entry.claimedDeviceId !== undefined &&
+      this.activeDeviceLeases.get(entry.claimedDeviceId) === entry.lease.leaseId
+    ) {
+      this.activeDeviceLeases.delete(entry.claimedDeviceId);
     }
   }
 }
