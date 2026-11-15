@@ -73,11 +73,31 @@ export class WebDriverClient {
   private readonly transport: WebDriverTransport;
   private readonly sessionCreateTimeoutMs: number;
   private sessionId: string | undefined;
+  private borrowedSession = false;
 
   constructor(options: WebDriverClientOptions) {
     this.transport = new WebDriverTransport(options);
     this.sessionCreateTimeoutMs =
       options.requestPolicy?.sessionCreateTimeoutMs ?? DEFAULT_SESSION_CREATE_TIMEOUT_MS;
+  }
+
+  /** Attaches locally; the caller retains ownership of the remote session. */
+  borrowSession(session: WebDriverSession): WebDriverSession {
+    if (
+      this.sessionId !== undefined ||
+      typeof session.sessionId !== 'string' ||
+      !/^[A-Za-z0-9_-]+$/.test(session.sessionId) ||
+      !session.capabilities ||
+      typeof session.capabilities !== 'object' ||
+      Array.isArray(session.capabilities)
+    ) {
+      throw new AppError('INVALID_ARGS', 'A borrowed WebDriver session needs a valid unused identity.', {
+        reason: 'invalid_borrowed_webdriver_session',
+      });
+    }
+    this.sessionId = session.sessionId;
+    this.borrowedSession = true;
+    return session;
   }
 
   /**
@@ -91,6 +111,11 @@ export class WebDriverClient {
     capabilities: Record<string, unknown>,
     options?: { deadline?: number },
   ): Promise<WebDriverSession> {
+    if (this.borrowedSession) {
+      throw new AppError('INVALID_ARGS', 'A borrowed WebDriver session cannot create another session.', {
+        reason: 'borrowed_webdriver_session',
+      });
+    }
     const value = await this.requestValue(
       'POST',
       '/session',
@@ -110,6 +135,11 @@ export class WebDriverClient {
    */
   async deleteSession(): Promise<void> {
     const sessionId = this.requireSessionId();
+    if (this.borrowedSession) {
+      this.sessionId = undefined;
+      this.borrowedSession = false;
+      return;
+    }
     try {
       await this.requestValue('DELETE', `/session/${sessionId}`, undefined, { idempotent: true });
     } catch (error) {

@@ -405,8 +405,8 @@ export class WebDriverSessionManager {
     } catch (error) {
       warnings.push({ code: 'PROVIDER_CLEANUP_FAILED', message: errorMessage(error) });
     }
-    // Only a hub that answered can say the session is gone. A delete the provider refused leaves the
-    // session billing, and this manager has no way left to learn otherwise.
+    // For borrowed sessions, confirmation covers this attachment only. The external owner keeps the
+    // remote session. Managed sessions still require the hub to confirm deletion.
     const cleanup = warnings.length > 0 ? 'uncertain' : 'confirmed';
     return { cleanup, session, warnings, cleanupPayload };
   }
@@ -490,6 +490,9 @@ export class WebDriverSessionManager {
     req: LeaseLifecycleContext | undefined,
   ): Promise<WebDriverSession> {
     try {
+      if (prepared.borrowedSession !== undefined) {
+        return client.borrowSession(prepared.borrowedSession);
+      }
       return await client.createSession(prepared.webdriverCapabilities, {
         deadline: req?.deadline,
       });

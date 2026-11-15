@@ -27,7 +27,11 @@ import {
 } from './capabilities.ts';
 import { createWebDriverDeploymentRuntime } from './runtime-deployment.ts';
 import { WebDriverSessionManager } from './runtime-session.ts';
-import type { WebDriverAuth, WebDriverRequestPolicy } from './webdriver-client.ts';
+import type {
+  WebDriverAuth,
+  WebDriverRequestPolicy,
+  WebDriverSession,
+} from './webdriver-client.ts';
 
 export type CloudWebDriverPlatform = 'android' | 'ios';
 
@@ -64,6 +68,8 @@ export type CloudWebDriverBaseSession = {
 export type CloudWebDriverPreparedSession = CloudWebDriverBaseSession & {
   deviceId?: string;
   providerSessionId?: string;
+  /** An existing owner-managed session. Releasing this lease must not end that session. */
+  borrowedSession?: WebDriverSession;
   uploadApp?: CloudWebDriverUploadApp;
   listArtifacts?: CloudWebDriverListArtifacts;
   cleanup?: () => Promise<Record<string, unknown> | undefined>;

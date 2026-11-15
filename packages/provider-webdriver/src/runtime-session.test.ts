@@ -133,6 +133,72 @@ test('cloud artifact lookup does not accept a provider session id without its le
   }
 });
 
+test.each(['release', 'shutdown'] as const)(
+  'borrowing an existing WebDriver session does not create or delete it on %s',
+  async (end) => {
+    const requests: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      requests.push(`${init?.method ?? 'GET'} ${String(input)}`);
+      throw new Error('a borrowed session must not send a lifecycle request');
+    };
+    let cleanups = 0;
+    const runtime = makeRuntime({
+      prepareSession: async ({ base }) => ({
+        ...base,
+        borrowedSession: { sessionId: 'owner-session', capabilities: {} },
+        cleanup: async () => {
+          cleanups += 1;
+          return undefined;
+        },
+      }),
+    });
+    const lease = makeLease();
+    try {
+      const allocated = await runtime.leaseLifecycle.allocate!(lease);
+      assert.equal(allocated?.sessionId, 'owner-session');
+      if (end === 'release') await runtime.leaseLifecycle.release!(lease);
+      else await runtime.shutdown();
+      assert.deepEqual(requests, []);
+      assert.equal(cleanups, 1);
+    } finally {
+      await runtime.shutdown();
+    }
+  },
+);
+
+test('invalid borrowed session identity fails before HTTP and cleans provider resources', async () => {
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(String(input));
+    throw new Error('invalid borrowed identity reached HTTP');
+  };
+  let cleanups = 0;
+  const runtime = makeRuntime({
+    prepareSession: async ({ base }) => ({
+      ...base,
+      borrowedSession: { sessionId: ' ', capabilities: {} },
+      cleanup: async () => {
+        cleanups += 1;
+        return undefined;
+      },
+    }),
+  });
+  try {
+    await assert.rejects(
+      () => runtime.leaseLifecycle.allocate!(makeLease()),
+      (error: unknown) => {
+        assert.ok(error instanceof AppError);
+        assert.equal(error.details?.reason, 'invalid_borrowed_webdriver_session');
+        return true;
+      },
+    );
+    assert.deepEqual(requests, []);
+    assert.equal(cleanups, 1);
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
 function makeRuntime(overrides: Partial<CloudWebDriverRuntimeOptions> = {}) {
   return createCloudWebDriverRuntime({
     clientVersion: 'test',
