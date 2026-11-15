@@ -28,6 +28,11 @@ export const pluginsCommand: ClientCommandHandler = async ({ positionals, flags 
       name,
       process.env,
       BUILTIN_PROVIDER_IDS,
+      {
+        localTarball: flags.localTarball,
+        sha256: flags.sha256,
+        allowLocalPackage: flags.allowLocalPackage,
+      },
     );
   }
   const plugins = await listPlugins(process.env, BUILTIN_PROVIDER_IDS);

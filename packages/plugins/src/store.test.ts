@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { runCmd } from '@agent-device/host-kit/command';
@@ -35,12 +36,21 @@ function installedPlugins(env: NodeJS.ProcessEnv) {
 
 function installFixture(name = packageName, apiVersion = 1, provider = 'example') {
   vi.mocked(runCmd).mockImplementation(async (command, argv, options) => {
-    assert.equal(command, 'npm');
-    assert.equal(argv[argv.indexOf('--prefix') + 1], options!.cwd);
-    assert.ok(argv.includes('--global=false'));
-    assert.ok(argv.includes('--ignore-scripts'));
-    assert.ok(argv.includes('--workspaces=false'));
-    assert.ok(argv.includes('--package-lock=true'));
+    const isWindowsNpmShim = process.platform === 'win32' && command === process.execPath;
+    const npmArgs = isWindowsNpmShim ? argv.slice(1) : argv;
+    if (isWindowsNpmShim) {
+      assert.equal(path.basename(argv[0] ?? ''), 'npm-cli.js');
+    } else {
+      assert.equal(command, 'npm');
+    }
+    assert.equal(npmArgs[0], 'install');
+    assert.equal(npmArgs[npmArgs.indexOf('--prefix') + 1], options!.cwd);
+    assert.ok(npmArgs.includes('--global=false'));
+    assert.ok(npmArgs.includes('--ignore-scripts'));
+    assert.ok(npmArgs.includes('--no-audit'));
+    assert.ok(npmArgs.includes('--no-fund'));
+    assert.ok(npmArgs.includes('--workspaces=false'));
+    assert.ok(npmArgs.includes('--package-lock=true'));
     writePlugin(options!.cwd!, name, apiVersion, provider);
     return { stdout: '', stderr: '', exitCode: 0 };
   });
@@ -203,4 +213,285 @@ test('a package that declares the v1 manifest and exports ./agent-device still s
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, name: 'someone-else' }));
   assert.deepEqual(legacyStoreManifests(env), []);
+});
+
+function writeTarballFile(directory: string, filename: string, content: string): { path: string; sha256: string } {
+  const filePath = path.join(directory, filename);
+  const bytes = Buffer.from(content, 'utf8');
+  fs.writeFileSync(filePath, bytes);
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  return { path: filePath, sha256 };
+}
+
+test('local tarball add stages pinned copy before npm, survives post-staging original mutation, and supports .tar.gz', async () => {
+  const { home, env } = pluginHome();
+  const sourceDir = path.join(home, 'sources');
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const tgz = writeTarballFile(sourceDir, 'provider-v1.tgz', 'tarball-bytes-v1');
+  const tarGz = writeTarballFile(sourceDir, 'other-v1.tar.gz', 'tar-gz-bytes-v1');
+
+  vi.mocked(runCmd).mockImplementationOnce(async (_command, _argv, options) => {
+    const project = options!.cwd!;
+    const stagedFile = path.join(project, 'package.tgz');
+    assert.equal(fs.readFileSync(stagedFile, 'utf8'), 'tarball-bytes-v1');
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).dependencies,
+      { [packageName]: 'file:./package.tgz' },
+    );
+    // Mutate the original source after staging to prove npm installs only the pinned staged copy.
+    fs.writeFileSync(tgz.path, 'mutated-after-staging');
+    writePlugin(project, packageName, 1, 'example');
+    return { stdout: '', stderr: '', exitCode: 0 };
+  });
+
+  await changePlugin('add', packageName, env, [], {
+    localTarball: tgz.path,
+    sha256: tgz.sha256.toUpperCase(),
+    allowLocalPackage: true,
+  });
+
+  const configAfterFirst = readPluginConfig(env);
+  assert.equal(configAfterFirst.plugins[packageName].version, undefined);
+  assert.deepEqual(configAfterFirst.plugins[packageName].localPackage, {
+    path: tgz.path,
+    sha256: tgz.sha256,
+  });
+
+  vi.mocked(runCmd).mockImplementationOnce(async (_command, _argv, options) => {
+    const project = options!.cwd!;
+    assert.equal(fs.readFileSync(path.join(project, 'package.tar.gz'), 'utf8'), 'tar-gz-bytes-v1');
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).dependencies,
+      { other: 'file:./package.tar.gz' },
+    );
+    writePlugin(project, 'other', 1, 'other');
+    return { stdout: '', stderr: '', exitCode: 0 };
+  });
+
+  await changePlugin('add', 'other', env, [], {
+    localTarball: tarGz.path,
+    sha256: tarGz.sha256,
+    allowLocalPackage: true,
+  });
+
+  const listed = await listPlugins(env, []);
+  assert.deepEqual(
+    listed.map(({ name, compatible, provider }) => [name, compatible, provider]),
+    [
+      ['@example/provider', true, 'example'],
+      ['other', true, 'other'],
+    ],
+  );
+});
+
+test('local tarball add rejects invalid options, paths, symlinks, and sha256 before npm and preserves existing selection', async () => {
+  const { home, env } = pluginHome();
+  installFixture();
+  await changePlugin('add', `${packageName}@1.2.3`, env, []);
+  const beforeConfig = fs.readFileSync(path.join(home, 'config.json'), 'utf8');
+  const beforeDirs = fs.readdirSync(path.join(home, 'plugins'));
+  vi.mocked(runCmd).mockClear();
+
+  const sourceDir = path.join(home, 'sources');
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const valid = writeTarballFile(sourceDir, 'valid.tgz', 'valid-tarball');
+  const symlinkPath = path.join(sourceDir, 'symlink.tgz');
+  fs.symlinkSync(valid.path, symlinkPath);
+  const dirAsTarball = path.join(sourceDir, 'dir.tgz');
+  fs.mkdirSync(dirAsTarball);
+
+  const invalidCases: Array<[string, Parameters<typeof changePlugin>[4]]> = [
+    // Missing / partial options and opt-in
+    [packageName, { localTarball: valid.path, sha256: valid.sha256 }],
+    [packageName, { localTarball: valid.path, allowLocalPackage: true }],
+    [packageName, { sha256: valid.sha256, allowLocalPackage: true }],
+    [packageName, { allowLocalPackage: true }],
+    [packageName, { localTarball: valid.path }],
+    [packageName, { sha256: valid.sha256 }],
+    // Combined with @version or @tag
+    [`${packageName}@1.0.0`, { localTarball: valid.path, sha256: valid.sha256, allowLocalPackage: true }],
+    [`${packageName}@latest`, { localTarball: valid.path, sha256: valid.sha256, allowLocalPackage: true }],
+    // Relative paths and URLs
+    [packageName, { localTarball: './valid.tgz', sha256: valid.sha256, allowLocalPackage: true }],
+    [packageName, { localTarball: '../valid.tgz', sha256: valid.sha256, allowLocalPackage: true }],
+    [packageName, { localTarball: 'valid.tgz', sha256: valid.sha256, allowLocalPackage: true }],
+    [packageName, { localTarball: `file://${valid.path}`, sha256: valid.sha256, allowLocalPackage: true }],
+    [packageName, { localTarball: 'https://example.com/valid.tgz', sha256: valid.sha256, allowLocalPackage: true }],
+    // Bad extension, missing file, non-regular directory, symlink
+    [packageName, { localTarball: path.join(sourceDir, 'bad.zip'), sha256: valid.sha256, allowLocalPackage: true }],
+    [packageName, { localTarball: path.join(sourceDir, 'missing.tgz'), sha256: valid.sha256, allowLocalPackage: true }],
+    [packageName, { localTarball: dirAsTarball, sha256: valid.sha256, allowLocalPackage: true }],
+    [packageName, { localTarball: symlinkPath, sha256: valid.sha256, allowLocalPackage: true }],
+    // Malformed and mismatched SHA-256
+    [packageName, { localTarball: valid.path, sha256: 'abc', allowLocalPackage: true }],
+    [packageName, { localTarball: valid.path, sha256: 'g'.repeat(64), allowLocalPackage: true }],
+    [packageName, { localTarball: valid.path, sha256: `sha256:${valid.sha256}`, allowLocalPackage: true }],
+    [packageName, { localTarball: valid.path, sha256: '0'.repeat(64), allowLocalPackage: true }],
+  ];
+
+  for (const [target, options] of invalidCases) {
+    await assert.rejects(changePlugin('add', target, env, [], options), { code: 'INVALID_ARGS' });
+  }
+
+  assert.equal(vi.mocked(runCmd).mock.calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
+  assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')), beforeDirs);
+});
+
+test('local tarball add cleans failed staging and preserves prior selection on package mismatch, staged tamper, npm failure, or provider collision', async () => {
+  const { home, env } = pluginHome();
+  installFixture();
+  await changePlugin('add', `${packageName}@1.2.3`, env, []);
+  const beforeConfig = fs.readFileSync(path.join(home, 'config.json'), 'utf8');
+  const beforeDirs = fs.readdirSync(path.join(home, 'plugins'));
+
+  const sourceDir = path.join(home, 'sources');
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const tarball = writeTarballFile(sourceDir, 'plug.tgz', 'plug-bytes');
+
+  // Package name mismatch in installed metadata
+  vi.mocked(runCmd).mockImplementationOnce(async (_cmd, _argv, options) => {
+    const dir = writePlugin(options!.cwd!, packageName, 1, 'other');
+    const manifestPath = path.join(dir, 'package.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, name: '@wrong/package' }));
+    return { stdout: '', stderr: '', exitCode: 0 };
+  });
+  await assert.rejects(
+    changePlugin('add', packageName, env, [], {
+      localTarball: tarball.path,
+      sha256: tarball.sha256,
+      allowLocalPackage: true,
+    }),
+    { code: 'INVALID_ARGS' },
+  );
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
+  assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')), beforeDirs);
+
+  // Tampered staged archive before promotion
+  vi.mocked(runCmd).mockImplementationOnce(async (_cmd, _argv, options) => {
+    writePlugin(options!.cwd!, packageName, 1, 'example');
+    fs.writeFileSync(path.join(options!.cwd!, 'package.tgz'), 'tampered-staged-bytes');
+    return { stdout: '', stderr: '', exitCode: 0 };
+  });
+  await assert.rejects(
+    changePlugin('add', packageName, env, [], {
+      localTarball: tarball.path,
+      sha256: tarball.sha256,
+      allowLocalPackage: true,
+    }),
+    { code: 'INVALID_ARGS' },
+  );
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
+  assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')), beforeDirs);
+
+  // npm install failure
+  vi.mocked(runCmd).mockRejectedValueOnce(new Error('npm failed'));
+  await assert.rejects(
+    changePlugin('add', packageName, env, [], {
+      localTarball: tarball.path,
+      sha256: tarball.sha256,
+      allowLocalPackage: true,
+    }),
+    /npm failed/,
+  );
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
+  assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')), beforeDirs);
+
+  // Provider collision with reserved built-in
+  vi.mocked(runCmd).mockImplementationOnce(async (_cmd, _argv, options) => {
+    writePlugin(options!.cwd!, 'other', 1, 'example');
+    return { stdout: '', stderr: '', exitCode: 0 };
+  });
+  await assert.rejects(
+    changePlugin('add', 'other', env, [], {
+      localTarball: tarball.path,
+      sha256: tarball.sha256,
+      allowLocalPackage: true,
+    }),
+    { code: 'INVALID_ARGS' },
+  );
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
+  assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')), beforeDirs);
+});
+
+test('local tarball update requires --allow-local-package, reuses saved pin unless replacing both, and remove rejects local flags', async () => {
+  const { home, env } = pluginHome();
+  const sourceDir = path.join(home, 'sources');
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const v1 = writeTarballFile(sourceDir, 'v1.tgz', 'v1-bytes');
+  const v2 = writeTarballFile(sourceDir, 'v2.tgz', 'v2-bytes');
+
+  installFixture();
+  await changePlugin('add', packageName, env, [], {
+    localTarball: v1.path,
+    sha256: v1.sha256,
+    allowLocalPackage: true,
+  });
+
+  const config = readPluginConfig(env);
+  config.plugins[packageName].options = { region: 'eu' };
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(config));
+  const beforeConfig = fs.readFileSync(path.join(home, 'config.json'), 'utf8');
+
+  vi.mocked(runCmd).mockClear();
+  // Missing --allow-local-package on persisted local update fails before npm
+  await assert.rejects(changePlugin('update', packageName, env, []), { code: 'INVALID_ARGS' });
+  // Partial replacement fails before npm
+  await assert.rejects(
+    changePlugin('update', packageName, env, [], { localTarball: v2.path, allowLocalPackage: true }),
+    { code: 'INVALID_ARGS' },
+  );
+  await assert.rejects(
+    changePlugin('update', packageName, env, [], { sha256: v2.sha256, allowLocalPackage: true }),
+    { code: 'INVALID_ARGS' },
+  );
+  assert.equal(vi.mocked(runCmd).mock.calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
+
+  // Reusing saved pin fails before npm if original file changed
+  fs.writeFileSync(v1.path, 'corrupted-v1');
+  await assert.rejects(
+    changePlugin('update', packageName, env, [], { allowLocalPackage: true }),
+    { code: 'INVALID_ARGS' },
+  );
+  assert.equal(vi.mocked(runCmd).mock.calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
+
+  // Restoring v1 bytes lets pinned update succeed with explicit opt-in
+  fs.writeFileSync(v1.path, 'v1-bytes');
+  await changePlugin('update', packageName, env, [], { allowLocalPackage: true });
+  const updatedSame = readPluginConfig(env).plugins[packageName];
+  assert.deepEqual(updatedSame.localPackage, { path: v1.path, sha256: v1.sha256 });
+  assert.deepEqual(updatedSame.options, { region: 'eu' });
+
+  // Replacing both path and sha256 updates persisted pin while keeping options
+  await changePlugin('update', packageName, env, [], {
+    localTarball: v2.path,
+    sha256: v2.sha256,
+    allowLocalPackage: true,
+  });
+  const updatedBoth = readPluginConfig(env).plugins[packageName];
+  assert.deepEqual(updatedBoth.localPackage, { path: v2.path, sha256: v2.sha256 });
+  assert.deepEqual(updatedBoth.options, { region: 'eu' });
+
+  // remove rejects local flags without touching selection
+  const beforeRemove = fs.readFileSync(path.join(home, 'config.json'), 'utf8');
+  await assert.rejects(
+    changePlugin('remove', packageName, env, [], { allowLocalPackage: true }),
+    { code: 'INVALID_ARGS' },
+  );
+  await assert.rejects(
+    changePlugin('remove', packageName, env, [], { localTarball: v2.path }),
+    { code: 'INVALID_ARGS' },
+  );
+  await assert.rejects(
+    changePlugin('remove', packageName, env, [], { sha256: v2.sha256 }),
+    { code: 'INVALID_ARGS' },
+  );
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeRemove);
+
+  // Plain remove removes the local selection while preserving old installation directories
+  await changePlugin('remove', packageName, env, []);
+  assert.deepEqual(installedPlugins(env), []);
 });

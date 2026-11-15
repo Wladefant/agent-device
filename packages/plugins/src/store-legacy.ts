@@ -5,9 +5,14 @@ import { isRecord } from '@agent-device/kernel/record';
 import { resolveUserConfigPath } from '@agent-device/host-kit/file';
 import { readPluginManifest, type PluginManifest } from './manifest.ts';
 
+export type LocalPackagePin = {
+  path: string;
+  sha256: string;
+};
 export type PluginSelection = {
   installation: string;
   version?: string;
+  localPackage?: LocalPackagePin;
   options?: Record<string, unknown>;
 };
 type PluginConfig = Record<string, unknown> & { plugins?: Record<string, PluginSelection> };
@@ -33,6 +38,8 @@ export function validatePluginSelection(name: string, selection: PluginSelection
     typeof selection.installation !== 'string' ||
     !/^[a-f0-9-]{36}$/.test(selection.installation) ||
     (selection.version !== undefined && !isVersionSelector(selection.version)) ||
+    (selection.localPackage !== undefined &&
+      (selection.version !== undefined || !isValidLocalPackageSelection(selection.localPackage))) ||
     (selection.options !== undefined && !isRecord(selection.options))
   ) {
     throw new AppError('INVALID_ARGS', `Invalid plugin selection: ${name}`);
@@ -80,4 +87,24 @@ export function isVersionSelector(value: unknown): value is string {
   return (
     typeof value === 'string' && /^[a-zA-Z0-9*^~<>=| .+-]+$/.test(value) && value.trim().length > 0
   );
+}
+
+export function isSha256Hex(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
+}
+
+export function isLocalTarballPath(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  if (value.trim().length === 0 || value.trim() !== value || value.includes('\0')) return false;
+  // Reject URL schemes (file:, https:, npm:, etc.) while allowing Windows drive prefixes (C:\...).
+  if (value.includes('://') || /^[a-zA-Z][a-zA-Z0-9+.-]+:/.test(value)) return false;
+  if (!path.isAbsolute(value)) return false;
+  return value.endsWith('.tgz') || value.endsWith('.tar.gz');
+}
+
+export function isValidLocalPackageSelection(value: unknown): value is LocalPackagePin {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes('path') || !keys.includes('sha256')) return false;
+  return isLocalTarballPath(value.path) && isSha256Hex(value.sha256);
 }

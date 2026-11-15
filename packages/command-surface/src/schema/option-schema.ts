@@ -24,6 +24,9 @@ const CONFIG_EXCLUDED_FLAG_KEYS = new Set<FlagKey>([
   'githubActionsArtifact',
   // A default must never switch a fill to waiting on stdin.
   'textStdin',
+  'localTarball',
+  'sha256',
+  'allowLocalPackage',
 ]);
 
 const ENV_EXCLUDED_FLAG_KEYS = new Set<FlagKey>([
@@ -36,6 +39,10 @@ const ENV_EXCLUDED_FLAG_KEYS = new Set<FlagKey>([
   'deviceMode',
   'deviceBaseline',
   'physical',
+  // Local plugin tarball installs and opt-in must come from explicit CLI flags only.
+  'localTarball',
+  'sha256',
+  'allowLocalPackage',
 ]);
 
 const optionSpecs = buildOptionSpecs();
