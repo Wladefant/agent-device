@@ -18,6 +18,7 @@ import { pathToFileURL } from 'node:url';
 import { isRecord } from '@agent-device/kernel/record';
 import { AppError } from '@agent-device/kernel/errors';
 import { runCmd } from '@agent-device/host-kit/command';
+import { extractArchiveSafely } from '@agent-device/host-kit/archive';
 import {
   acquireProcessLock,
   openVerifiedFileForRead,
@@ -192,38 +193,46 @@ function normalizeSha256(value: string): string {
   return value.toLowerCase();
 }
 
-function resolveWindowsNpmCliScript(env: NodeJS.ProcessEnv): string | undefined {
-  const advertised = env.npm_execpath?.trim();
-  if (advertised) {
-    const scriptPath = path.resolve(advertised);
-    if (path.basename(scriptPath) === 'npm-cli.js' && isRegularFile(scriptPath)) return scriptPath;
-  }
-  const bundled = path.join(
-    path.dirname(process.execPath),
-    'node_modules',
-    'npm',
-    'bin',
-    'npm-cli.js',
-  );
-  return isRegularFile(bundled) ? bundled : undefined;
-}
-
-function isRegularFile(filePath: string): boolean {
+function resolveWindowsNpmCliScript(): string | undefined {
+  const candidateDirs: string[] = [];
   try {
-    return fs.statSync(filePath).isFile();
+    const realExec = fs.realpathSync(process.execPath);
+    candidateDirs.push(path.dirname(realExec));
   } catch {
-    return false;
+    // If realpath fails, fallback to dirname
   }
+  const execDir = path.dirname(process.execPath);
+  if (!candidateDirs.includes(execDir)) {
+    candidateDirs.push(execDir);
+  }
+
+  for (const dir of candidateDirs) {
+    const candidates = [
+      path.join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      path.join(dir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    ];
+    for (const candidate of candidates) {
+      try {
+        const real = fs.realpathSync(path.resolve(candidate));
+        if (fs.statSync(real).isFile() && path.basename(real) === 'npm-cli.js') {
+          return real;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  return undefined;
 }
 
 function resolveNpmInvocation(
-  env: NodeJS.ProcessEnv,
+  _env: NodeJS.ProcessEnv,
   args: string[],
 ): { command: string; args: string[] } {
   if (process.platform !== 'win32') return { command: 'npm', args };
-  const npmCliScript = resolveWindowsNpmCliScript(env);
+  const npmCliScript = resolveWindowsNpmCliScript();
   if (!npmCliScript) {
-    throw new AppError('TOOL_MISSING', 'npm not found in PATH', {
+    throw new AppError('TOOL_MISSING', 'npm not found in Node.js toolchain', {
       nodeExecPath: process.execPath,
       hint: 'Install Node.js with npm, or add npm to PATH, and retry.',
     });
@@ -328,6 +337,136 @@ function assertSha256Matches(actualHex: string, expectedHex: string, name: strin
   }
 }
 
+function hasDeclaredDependencies(value: unknown): boolean {
+  if (value === true) return true;
+  if (Array.isArray(value) && value.length > 0) return true;
+  if (isRecord(value) && Object.keys(value).length > 0) return true;
+  return false;
+}
+
+async function inspectLocalTarballManifest(
+  stagedTarballPath: string,
+  stagedFileName: string,
+  expectedName: string,
+  projectDir: string,
+): Promise<void> {
+  const preflightDir = path.join(projectDir, '.manifest-preflight');
+  const archiveType = stagedFileName.endsWith('.tar.gz') || stagedFileName.endsWith('.tgz')
+    ? 'tgz'
+    : 'tar';
+  try {
+    try {
+      await extractArchiveSafely({
+        archivePath: stagedTarballPath,
+        outputRoot: preflightDir,
+        type: archiveType,
+      });
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        'INVALID_ARGS',
+        `Failed to unpack local plugin tarball: ${error instanceof Error ? error.message : String(error)}`,
+        { reason: 'invalid_plugin' },
+        error instanceof Error ? error : undefined,
+      );
+    }
+    let manifestPath = path.join(preflightDir, 'package', 'package.json');
+    if (!fs.existsSync(manifestPath)) {
+      manifestPath = path.join(preflightDir, 'package.json');
+    }
+    if (!fs.existsSync(manifestPath)) {
+      throw new AppError('INVALID_ARGS', `Local plugin tarball missing package.json: ${expectedName}`, {
+        reason: 'invalid_plugin',
+      });
+    }
+    let manifest: Record<string, unknown>;
+    try {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    } catch (error) {
+      throw new AppError(
+        'INVALID_ARGS',
+        `Local plugin tarball package.json is not valid JSON: ${expectedName}`,
+        { reason: 'invalid_plugin' },
+        error instanceof Error ? error : undefined,
+      );
+    }
+    if (manifest.name !== expectedName) {
+      throw new AppError('INVALID_ARGS', `Plugin package identity mismatch: ${expectedName}`);
+    }
+    if (typeof manifest.version !== 'string' || manifest.version.trim().length === 0) {
+      throw new AppError('INVALID_ARGS', `Plugin package has no version: ${expectedName}`, {
+        reason: 'invalid_plugin',
+      });
+    }
+
+    const dependencyFields = [
+      'dependencies',
+      'optionalDependencies',
+      'peerDependencies',
+      'bundleDependencies',
+      'bundledDependencies',
+    ] as const;
+
+    for (const field of dependencyFields) {
+      if (hasDeclaredDependencies(manifest[field])) {
+        throw new AppError(
+          'INVALID_ARGS',
+          `Local plugin tarball cannot declare ${field}: ${expectedName}`,
+          { reason: 'invalid_plugin' },
+        );
+      }
+    }
+  } finally {
+    fs.rmSync(preflightDir, { recursive: true, force: true });
+  }
+}
+
+function assertNoEscapingSymlinks(rootDir: string): void {
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(rootDir);
+  } catch (error) {
+    throw new AppError(
+      'INVALID_ARGS',
+      `Cannot resolve staging root: ${rootDir}`,
+      { reason: 'invalid_plugin' },
+      error instanceof Error ? error : undefined,
+    );
+  }
+  const realRootWithSep = realRoot.endsWith(path.sep) ? realRoot : `${realRoot}${path.sep}`;
+
+  function checkDir(currentDir: string): void {
+    const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isSymbolicLink()) {
+        let realTarget: string;
+        try {
+          realTarget = fs.realpathSync(fullPath);
+        } catch (error) {
+          throw new AppError(
+            'INVALID_ARGS',
+            `Unresolvable symlink in plugin installation: ${fullPath}`,
+            { reason: 'invalid_plugin' },
+            error instanceof Error ? error : undefined,
+          );
+        }
+        if (realTarget !== realRoot && !realTarget.startsWith(realRootWithSep)) {
+          throw new AppError(
+            'INVALID_ARGS',
+            `Installed plugin contains symlink escaping staging directory: ${fullPath}`,
+            { reason: 'invalid_plugin' },
+          );
+        }
+      } else if (entry.isDirectory()) {
+        checkDir(fullPath);
+      }
+    }
+  }
+
+  checkDir(rootDir);
+}
+
 type StagedPlugin = {
   installation: string;
   project: string;
@@ -352,6 +491,7 @@ async function stagePlugin(
       stagedTarballPath = path.join(project, stagedFileName);
       copyVerifiedTarballToStage(source.pin.path, stagedTarballPath);
       assertSha256Matches(hashVerifiedFileSha256(stagedTarballPath), source.pin.sha256, name);
+      await inspectLocalTarballManifest(stagedTarballPath, stagedFileName, name, project);
       fs.writeFileSync(
         path.join(project, 'package.json'),
         JSON.stringify({
@@ -373,6 +513,7 @@ async function stagePlugin(
     if (source.kind === 'local' && stagedTarballPath !== undefined) {
       assertSha256Matches(hashVerifiedFileSha256(stagedTarballPath), source.pin.sha256, name);
     }
+    assertNoEscapingSymlinks(project);
     const installDir = installationDirectory(home, name, installation);
     let installStats: fs.Stats;
     try {
@@ -384,6 +525,15 @@ async function stagePlugin(
       throw new AppError('INVALID_ARGS', `Installed plugin must be a regular directory: ${name}`);
     }
     const staged = await describeInstallation(name, installDir, { installation });
+    if (staged.entry.kind === 'v2') {
+      // Runtime-staged plugin entry is dynamically loaded to validate default factory before promotion.
+      const module = await import(pathToFileURL(staged.entry.file).href);
+      if (typeof module.default !== 'function') {
+        throw new AppError('INVALID_ARGS', `Plugin must export a default factory: ${name}`, {
+          reason: 'invalid_plugin',
+        });
+      }
+    }
     return { installation, project, entry: staged.entry };
   } catch (error) {
     fs.rmSync(project, { recursive: true, force: true });

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { gzipSync } from 'node:zlib';
+import * as tar from 'tar-stream';
 import { afterEach, test, vi } from 'vitest';
 import { runCmd } from '@agent-device/host-kit/command';
 import { changePlugin, legacyStoreManifests, listPlugins } from './store.ts';
@@ -215,25 +217,52 @@ test('a package that declares the v1 manifest and exports ./agent-device still s
   assert.deepEqual(legacyStoreManifests(env), []);
 });
 
-function writeTarballFile(directory: string, filename: string, content: string): { path: string; sha256: string } {
+async function packTarball(
+  files: Record<string, string | Buffer>,
+): Promise<{ buffer: Buffer; sha256: string }> {
+  const pack = tar.pack();
+  for (const [name, content] of Object.entries(files)) {
+    pack.entry({ name }, typeof content === 'string' ? Buffer.from(content, 'utf8') : content);
+  }
+  pack.finalize();
+  const chunks: Buffer[] = [];
+  for await (const chunk of pack) chunks.push(Buffer.from(chunk));
+  const buffer = gzipSync(Buffer.concat(chunks));
+  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+  return { buffer, sha256 };
+}
+
+async function writeTarballFile(
+  directory: string,
+  filename: string,
+  targetPackage = packageName,
+  version = '1.0.0',
+): Promise<{ path: string; sha256: string; buffer: Buffer }> {
   const filePath = path.join(directory, filename);
-  const bytes = Buffer.from(content, 'utf8');
-  fs.writeFileSync(filePath, bytes);
-  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
-  return { path: filePath, sha256 };
+  const { buffer, sha256 } = await packTarball({
+    'package/package.json': JSON.stringify({
+      name: targetPackage,
+      version,
+      type: 'module',
+      exports: { './agent-device': './plugin.mjs' },
+    }),
+    'package/plugin.mjs': 'export default function() { return { provider: "test" }; }',
+  });
+  fs.writeFileSync(filePath, buffer);
+  return { path: filePath, sha256, buffer };
 }
 
 test('local tarball add stages pinned copy before npm, survives post-staging original mutation, and supports .tar.gz', async () => {
   const { home, env } = pluginHome();
   const sourceDir = path.join(home, 'sources');
   fs.mkdirSync(sourceDir, { recursive: true });
-  const tgz = writeTarballFile(sourceDir, 'provider-v1.tgz', 'tarball-bytes-v1');
-  const tarGz = writeTarballFile(sourceDir, 'other-v1.tar.gz', 'tar-gz-bytes-v1');
+  const tgz = await writeTarballFile(sourceDir, 'provider-v1.tgz', packageName);
+  const tarGz = await writeTarballFile(sourceDir, 'other-v1.tar.gz', 'other');
 
   vi.mocked(runCmd).mockImplementationOnce(async (_command, _argv, options) => {
     const project = options!.cwd!;
     const stagedFile = path.join(project, 'package.tgz');
-    assert.equal(fs.readFileSync(stagedFile, 'utf8'), 'tarball-bytes-v1');
+    assert.deepEqual(fs.readFileSync(stagedFile), tgz.buffer);
     assert.deepEqual(
       JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).dependencies,
       { [packageName]: 'file:./package.tgz' },
@@ -259,7 +288,7 @@ test('local tarball add stages pinned copy before npm, survives post-staging ori
 
   vi.mocked(runCmd).mockImplementationOnce(async (_command, _argv, options) => {
     const project = options!.cwd!;
-    assert.equal(fs.readFileSync(path.join(project, 'package.tar.gz'), 'utf8'), 'tar-gz-bytes-v1');
+    assert.deepEqual(fs.readFileSync(path.join(project, 'package.tar.gz')), tarGz.buffer);
     assert.deepEqual(
       JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).dependencies,
       { other: 'file:./package.tar.gz' },
@@ -294,7 +323,7 @@ test('local tarball add rejects invalid options, paths, symlinks, and sha256 bef
 
   const sourceDir = path.join(home, 'sources');
   fs.mkdirSync(sourceDir, { recursive: true });
-  const valid = writeTarballFile(sourceDir, 'valid.tgz', 'valid-tarball');
+  const valid = await writeTarballFile(sourceDir, 'valid.tgz', packageName);
   const symlinkPath = path.join(sourceDir, 'symlink.tgz');
   fs.symlinkSync(valid.path, symlinkPath);
   const dirAsTarball = path.join(sourceDir, 'dir.tgz');
@@ -347,7 +376,7 @@ test('local tarball add cleans failed staging and preserves prior selection on p
 
   const sourceDir = path.join(home, 'sources');
   fs.mkdirSync(sourceDir, { recursive: true });
-  const tarball = writeTarballFile(sourceDir, 'plug.tgz', 'plug-bytes');
+  const tarball = await writeTarballFile(sourceDir, 'plug.tgz', packageName);
 
   // Package name mismatch in installed metadata
   vi.mocked(runCmd).mockImplementationOnce(async (_cmd, _argv, options) => {
@@ -419,8 +448,8 @@ test('local tarball update requires --allow-local-package, reuses saved pin unle
   const { home, env } = pluginHome();
   const sourceDir = path.join(home, 'sources');
   fs.mkdirSync(sourceDir, { recursive: true });
-  const v1 = writeTarballFile(sourceDir, 'v1.tgz', 'v1-bytes');
-  const v2 = writeTarballFile(sourceDir, 'v2.tgz', 'v2-bytes');
+  const v1 = await writeTarballFile(sourceDir, 'v1.tgz', packageName, '1.0.0');
+  const v2 = await writeTarballFile(sourceDir, 'v2.tgz', packageName, '2.0.0');
 
   installFixture();
   await changePlugin('add', packageName, env, [], {
@@ -459,7 +488,7 @@ test('local tarball update requires --allow-local-package, reuses saved pin unle
   assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
 
   // Restoring v1 bytes lets pinned update succeed with explicit opt-in
-  fs.writeFileSync(v1.path, 'v1-bytes');
+  fs.writeFileSync(v1.path, v1.buffer);
   await changePlugin('update', packageName, env, [], { allowLocalPackage: true });
   const updatedSame = readPluginConfig(env).plugins[packageName];
   assert.deepEqual(updatedSame.localPackage, { path: v1.path, sha256: v1.sha256 });
@@ -494,4 +523,161 @@ test('local tarball update requires --allow-local-package, reuses saved pin unle
   // Plain remove removes the local selection while preserving old installation directories
   await changePlugin('remove', packageName, env, []);
   assert.deepEqual(installedPlugins(env), []);
+});
+
+
+test('local tarball with dependency declarations is rejected before npm', async () => {
+  const { home, env } = pluginHome();
+  const sourceDir = path.join(home, 'sources');
+  fs.mkdirSync(sourceDir, { recursive: true });
+  vi.mocked(runCmd).mockClear();
+
+  const forbiddenCases: Array<[string, Record<string, unknown>]> = [
+    ['dependencies with file path', { dependencies: { side: 'file:../outside' } }],
+    ['dependencies with package spec', { dependencies: { lodash: '^4.17.21' } }],
+    ['optionalDependencies', { optionalDependencies: { opt: '1.0.0' } }],
+    ['peerDependencies', { peerDependencies: { peer: '1.0.0' } }],
+    ['bundleDependencies array', { bundleDependencies: ['bundled-pkg'] }],
+    ['bundledDependencies array', { bundledDependencies: ['bundled-pkg'] }],
+    ['bundleDependencies boolean', { bundleDependencies: true }],
+  ];
+
+  for (const [label, depFields] of forbiddenCases) {
+    const manifest = {
+      name: packageName,
+      version: '1.0.0',
+      type: 'module',
+      exports: { './agent-device': './plugin.mjs' },
+      ...depFields,
+    };
+    const { buffer, sha256 } = await packTarball({
+      'package/package.json': JSON.stringify(manifest),
+      'package/plugin.mjs': 'export default function() { return {}; }',
+    });
+    const tarballPath = path.join(sourceDir, `dep-${sha256.slice(0, 8)}.tgz`);
+    fs.writeFileSync(tarballPath, buffer);
+
+    await assert.rejects(
+      changePlugin('add', packageName, env, [], {
+        localTarball: tarballPath,
+        sha256,
+        allowLocalPackage: true,
+      }),
+      { code: 'INVALID_ARGS' },
+      `Expected rejection for ${label}`,
+    );
+  }
+
+  // None of the invalid dependency tarballs ever invoked npm
+  assert.equal(vi.mocked(runCmd).mock.calls.length, 0);
+  assert.deepEqual(installedPlugins(env), []);
+});
+
+test('Windows ignores untrusted npm_execpath and resolves canonical npm-cli.js from Node toolchain', async () => {
+  if (process.platform !== 'win32') return;
+  const { home, env } = pluginHome();
+  const unrelatedDir = path.join(home, 'unrelated');
+  fs.mkdirSync(unrelatedDir, { recursive: true });
+
+  const maliciousScript = path.join(unrelatedDir, 'npm-cli.js');
+  fs.writeFileSync(maliciousScript, 'throw new Error("malicious npm-cli.js executed");');
+
+  const symlinkScript = path.join(unrelatedDir, 'symlinked-npm-cli.js');
+  try {
+    fs.symlinkSync(maliciousScript, symlinkScript);
+  } catch {
+    // If symlink creation fails due to privileges, skip symlink test
+  }
+
+  installFixture();
+
+  // Set untrusted npm_execpath to malicious script directly
+  const envWithMalicious = { ...env, npm_execpath: maliciousScript };
+  await changePlugin('add', `${packageName}@1.0.0`, envWithMalicious, []);
+
+  assert.equal(vi.mocked(runCmd).mock.calls.length, 1);
+  const [cmd, args] = vi.mocked(runCmd).mock.calls[0]!;
+  assert.equal(cmd, process.execPath);
+  assert.notEqual(args[0], maliciousScript);
+  assert.equal(path.basename(args[0] ?? ''), 'npm-cli.js');
+  // Canonical resolved path must be within node_modules/npm/bin/npm-cli.js under node installation
+  assert.ok(
+    args[0]!.toLowerCase().includes('npm'),
+    `Expected trusted npm-cli.js, got ${args[0]}`,
+  );
+
+  // If symlink was created, test with symlinked path
+  if (fs.existsSync(symlinkScript)) {
+    vi.mocked(runCmd).mockClear();
+    const envWithSymlink = { ...env, npm_execpath: symlinkScript };
+    await changePlugin('update', packageName, envWithSymlink, []);
+    assert.equal(vi.mocked(runCmd).mock.calls.length, 1);
+    const [, symlinkArgs] = vi.mocked(runCmd).mock.calls[0]!;
+    assert.notEqual(symlinkArgs[0], symlinkScript);
+    assert.notEqual(symlinkArgs[0], maliciousScript);
+    assert.equal(path.basename(symlinkArgs[0] ?? ''), 'npm-cli.js');
+  }
+});
+
+test('pre-promotion v2 validation rejects invalid default factory and retains prior working selection', async () => {
+  const { home, env } = pluginHome();
+  installFixture();
+  await changePlugin('add', `${packageName}@1.0.0`, env, []);
+  const beforeConfig = fs.readFileSync(path.join(home, 'config.json'), 'utf8');
+  const beforeDirs = fs.readdirSync(path.join(home, 'plugins'));
+  // Simulate an update package: proper v2 package (exports ./agent-device), but default is NOT a function
+  vi.mocked(runCmd).mockImplementationOnce(async (_cmd, _argv, options) => {
+    const dir = path.join(options!.cwd!, 'node_modules', packageName);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      JSON.stringify({
+        name: packageName,
+        version: '2.0.0',
+        type: 'module',
+        exports: { './agent-device': './plugin.mjs' },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'plugin.mjs'),
+      'export const unused = true;\nexport const notFactory = 123;\n',
+    );
+    return { stdout: '', stderr: '', exitCode: 0 };
+  });
+
+  await assert.rejects(
+    changePlugin('update', packageName, env, []),
+    { code: 'INVALID_ARGS' },
+  );
+
+  // Old configuration and prior selection are preserved
+  assert.equal(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), beforeConfig);
+  assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')), beforeDirs);
+});
+
+test('installed plugin with symlink escaping staging directory is rejected', async () => {
+  const { home, env } = pluginHome();
+  const outsideDir = path.join(home, 'outside-target');
+  fs.mkdirSync(outsideDir, { recursive: true });
+  fs.writeFileSync(path.join(outsideDir, 'external.js'), 'export const leaked = true;');
+
+  vi.mocked(runCmd).mockImplementationOnce(async (_cmd, _argv, options) => {
+    const dir = writePlugin(options!.cwd!, packageName, 1, 'example');
+    // Create an escaping symlink inside node_modules pointing outside project
+    try {
+      fs.symlinkSync(outsideDir, path.join(path.dirname(dir), 'escaping-link'), 'junction');
+    } catch {
+      // Fallback
+      fs.symlinkSync(outsideDir, path.join(path.dirname(dir), 'escaping-link'));
+    }
+    return { stdout: '', stderr: '', exitCode: 0 };
+  });
+
+  await assert.rejects(
+    changePlugin('add', packageName, env, []),
+    { code: 'INVALID_ARGS' },
+  );
+
+  assert.deepEqual(installedPlugins(env), []);
+  assert.equal(fs.readdirSync(path.join(home, 'plugins')).length, 0);
 });
