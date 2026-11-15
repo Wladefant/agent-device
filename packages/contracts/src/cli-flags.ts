@@ -176,6 +176,9 @@ export type CliFlags = CloudProviderProfileFields &
       runtime?: SessionRuntimeHints;
     }>;
     out?: string;
+    localTarball?: string;
+    sha256?: string;
+    allowLocalPackage?: boolean;
     help: boolean;
     version: boolean;
   };
@@ -186,4 +189,7 @@ export type DaemonExcludedCliFlag =
   | 'version'
   | 'batchSteps'
   | 'replayMaestro'
-  | 'daemonAuthToken';
+  | 'daemonAuthToken'
+  | 'localTarball'
+  | 'sha256'
+  | 'allowLocalPackage';

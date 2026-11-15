@@ -6,6 +6,8 @@ import { runCli } from '../../../cli.ts';
 import { readCurrentOwnerIdentity } from '@agent-device/host-kit/process';
 import { pluginHome, selectPlugin, beginStdoutCapture } from '@agent-device/test-kit';
 import { parseArgs, parseRawArgs, usageForCommand } from '../../parser/args.ts';
+import { resolveCliOptions } from '../../resolve-cli-options.ts';
+import { resolveConfigDefaults } from '@agent-device/command-surface';
 
 vi.mock('../../../provider-device-runtimes.ts', () => {
   throw new Error('provider runtimes must remain unloaded');
@@ -175,4 +177,133 @@ test('plugins list says when the daemon record cannot be used instead of hiding 
   const text = await listPluginsAsText(home, stateDir);
   assert.match(text, /No provider plugins installed\./);
   assert.match(text, /daemon record for .* is invalid, so its providers are unknown/);
+});
+
+test('plugins CLI schema exposes local tarball flags on add/update and rejects them on list/remove', async () => {
+  const sha = 'a'.repeat(64);
+  const addParsed = parseArgs([
+    'plugins',
+    'add',
+    '@example/provider',
+    '--local-tarball',
+    '/abs/provider.tgz',
+    '--sha256',
+    sha,
+    '--allow-local-package',
+  ]);
+  assert.equal(addParsed.flags.localTarball, '/abs/provider.tgz');
+  assert.equal(addParsed.flags.sha256, sha);
+  assert.equal(addParsed.flags.allowLocalPackage, true);
+
+  const updateParsed = parseArgs(['plugins', 'update', '@example/provider', '--allow-local-package']);
+  assert.equal(updateParsed.flags.allowLocalPackage, true);
+
+  for (const argv of [
+    ['plugins', 'remove', '@example/provider', '--allow-local-package'],
+    ['plugins', 'remove', '@example/provider', '--local-tarball', '/abs/provider.tgz'],
+    ['plugins', 'remove', '@example/provider', '--sha256', sha],
+    ['plugins', 'list', '--allow-local-package'],
+    ['plugins', 'list', '--local-tarball', '/abs/provider.tgz'],
+    ['plugins', 'list', '--sha256', sha],
+  ]) {
+    assert.throws(() => parseArgs(argv), { code: 'INVALID_ARGS' });
+  }
+
+  const help = await usageForCommand('plugins');
+  assert.ok(help);
+  assert.match(help, /--local-tarball <path>/);
+  assert.match(help, /--sha256 <sha256>/);
+  assert.match(help, /--allow-local-package/);
+});
+
+test('local plugin flags cannot come from config files or ambient environment variables', () => {
+  const { home } = pluginHome();
+  const sha = 'b'.repeat(64);
+  for (const [key, value] of [
+    ['allowLocalPackage', true],
+    ['localTarball', '/abs/provider.tgz'],
+    ['sha256', sha],
+  ] as const) {
+    fs.writeFileSync(path.join(home, 'agent-device.json'), JSON.stringify({ [key]: value }));
+    assert.throws(
+      () =>
+        resolveConfigDefaults({
+          command: 'plugins',
+          cwd: home,
+          cliFlags: { json: false, help: false, version: false },
+          env: { AGENT_DEVICE_HOME: home },
+        }),
+      { code: 'INVALID_ARGS' },
+    );
+    fs.rmSync(path.join(home, 'agent-device.json'));
+
+    const userConfig = path.join(home, 'config.json');
+    fs.writeFileSync(userConfig, JSON.stringify({ [key]: value }));
+    assert.throws(
+      () =>
+        resolveConfigDefaults({
+          command: 'plugins',
+          cwd: home,
+          cliFlags: { json: false, help: false, version: false },
+          env: { AGENT_DEVICE_HOME: home },
+        }),
+      { code: 'INVALID_ARGS' },
+    );
+    fs.rmSync(userConfig);
+  }
+
+  const resolved = resolveCliOptions(['plugins', 'add', '@example/provider'], {
+    cwd: home,
+    env: {
+      AGENT_DEVICE_HOME: home,
+      AGENT_DEVICE_ALLOW_LOCAL_PACKAGE: '1',
+      AGENT_DEVICE_LOCAL_TARBALL: '/abs/provider.tgz',
+      AGENT_DEVICE_SHA256: sha,
+    },
+  });
+  assert.equal(resolved.flags.allowLocalPackage, undefined);
+  assert.equal(resolved.flags.localTarball, undefined);
+  assert.equal(resolved.flags.sha256, undefined);
+});
+
+test('plugins add rejects missing opt-in via runCli before touching daemon or store', async () => {
+  const { home } = pluginHome();
+  vi.stubEnv('AGENT_DEVICE_HOME', home);
+  vi.stubEnv('AGENT_DEVICE_STATE_DIR', path.join(home, 'state'));
+  vi.stubEnv('AGENT_DEVICE_NO_UPDATE_NOTIFIER', '1');
+  const tarball = path.join(home, 'provider.tgz');
+  fs.writeFileSync(tarball, 'fake-tgz');
+  const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+    throw new Error(`process.exit:${code ?? 0}`);
+  }) as never);
+  const stdoutCapture = beginStdoutCapture();
+  try {
+    await assert.rejects(
+      runCli(
+        [
+          'plugins',
+          'add',
+          '@example/provider',
+          '--local-tarball',
+          tarball,
+          '--sha256',
+          'c'.repeat(64),
+          '--json',
+        ],
+        {
+          sendToDaemon: vi.fn(async () => {
+            throw new Error('unexpected daemon access');
+          }),
+        },
+      ),
+      /process\.exit:1/,
+    );
+    const result = JSON.parse(stdoutCapture.read());
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, 'INVALID_ARGS');
+    assert.ok(!fs.existsSync(path.join(home, 'config.json')));
+  } finally {
+    stdoutCapture.restore();
+    exitSpy.mockRestore();
+  }
 });

@@ -427,4 +427,33 @@ export const CONNECTION_FLAG_DEFINITIONS: readonly FlagDefinition[] = [
     projectConfig: true,
     recorded: false,
   },
+  {
+    key: 'localTarball',
+    names: ['--local-tarball'],
+    type: 'string',
+    usageLabel: '--local-tarball <path>',
+    usageDescription:
+      'Plugins: install from an absolute local .tgz or .tar.gz file (requires --sha256 and --allow-local-package)',
+    projectConfig: false,
+    recorded: false,
+  },
+  {
+    key: 'sha256',
+    names: ['--sha256'],
+    type: 'string',
+    usageLabel: '--sha256 <sha256>',
+    usageDescription: 'Plugins: expected 64-hex SHA-256 digest of the local plugin tarball',
+    projectConfig: false,
+    recorded: false,
+  },
+  {
+    key: 'allowLocalPackage',
+    names: ['--allow-local-package'],
+    type: 'boolean',
+    usageLabel: '--allow-local-package',
+    usageDescription:
+      'Plugins: explicit opt-in required to add or update a local tarball plugin',
+    projectConfig: false,
+    recorded: false,
+  },
 ];

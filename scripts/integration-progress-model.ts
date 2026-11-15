@@ -431,6 +431,12 @@ function summarizeProviderScenarioFlagExclusions() {
       owner: 'daemon screenshot-crop unit and live device verification',
       keys: ['screenshotCropOn'],
     },
+    {
+      // Local tarball plugin management runs offline in the CLI store without daemon/device dispatch.
+      name: 'trusted local plugin management',
+      owner: 'plugins store, CLI parser, and isolated local tarball install tests',
+      keys: ['localTarball', 'sha256', 'allowLocalPackage'],
+    },
   ];
 }
 
