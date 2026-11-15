@@ -301,6 +301,7 @@ export class WebDriverSessionManager {
       auth: prepared.auth,
       headers: prepared.headers,
       requestPolicy: this.options.requestPolicy,
+      guardedWdaTap: this.options.guardedWdaTap,
     });
     const session = await this.createSessionWithPreparedCleanup(client, prepared, lease, req);
     const device = this.deviceForLease(lease, prepared);

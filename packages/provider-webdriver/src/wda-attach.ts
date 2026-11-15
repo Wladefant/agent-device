@@ -12,7 +12,11 @@ import type { DeviceInfo } from '@agent-device/kernel/device';
 import { AppError } from '@agent-device/kernel/errors';
 import type { SnapshotNode } from '@agent-device/kernel/snapshot';
 import { createCloudWebDriverRuntime, type CloudWebDriverRuntime } from './runtime.ts';
-import { WebDriverClient, type WebDriverRequestPolicy } from './webdriver-client.ts';
+import {
+  WebDriverClient,
+  type GuardedWdaTap,
+  type WebDriverRequestPolicy,
+} from './webdriver-client.ts';
 
 const WDA_ATTACH_PROVIDER = 'wda-attach';
 
@@ -34,6 +38,7 @@ export type WdaAttachRuntimeOptions = Readonly<{
   deviceName?: string;
   clientVersion?: string;
   requestPolicy?: WebDriverRequestPolicy;
+  guardedWdaTap?: GuardedWdaTap;
 }>;
 
 export type WdaAttachTapSpec =
@@ -113,6 +118,7 @@ export function createWdaAttachRuntime(options: WdaAttachRuntimeOptions): CloudW
     existingSessionId: options.sessionId,
     sessionOwnership: 'attached',
     routeProfile: 'wda',
+    guardedWdaTap: options.guardedWdaTap,
     requestPolicy: options.requestPolicy ?? { timeoutMs: 30_000, retryAttempts: 0 },
     deviceId: () => deviceId,
   });
@@ -201,7 +207,7 @@ export async function runWdaAttachSequence(
     runId: 'wda-attach-pilot',
     clientId: 'wda-attach-pilot',
     leaseProvider: WDA_ATTACH_PROVIDER,
-    backend: 'ios-device',
+    backend: 'ios-instance',
     deviceKey: `${WDA_ATTACH_PROVIDER}:${options.udid}`,
     createdAt: Date.now(),
     expiresAt: Date.now() + 300_000,
@@ -209,7 +215,7 @@ export async function runWdaAttachSequence(
   };
 
   const device: DeviceInfo = {
-    platform: 'ios',
+    platform: 'apple',
     target: 'mobile',
     appleOs: 'ios',
     id: options.udid,
@@ -234,6 +240,7 @@ export async function runWdaAttachSequence(
   }
 
   let snapshotResult: SnapshotResult;
+  let snapshotNodes: Array<SnapshotNode & { ref: string }>;
   let snapshotMs: number;
   let screenshotMs: number;
   let screenshotBytes: number;
@@ -244,9 +251,16 @@ export async function runWdaAttachSequence(
     const tSnap0 = performance.now();
     const rawSnapshot = await interactor.snapshot({ interactiveOnly: true });
     snapshotResult =
-      rawSnapshot.stage === 'acquired'
+      'stage' in rawSnapshot
         ? presentIosSnapshotAcquisition(rawSnapshot, { interactiveOnly: true })
         : rawSnapshot;
+    const nodes = snapshotResult.nodes;
+    if (!nodes || !nodes.every((node): node is SnapshotNode & { ref: string } =>
+      typeof node.ref === 'string' && node.ref.length > 0
+    )) {
+      throw new AppError('COMMAND_FAILED', 'WDA snapshot did not contain referenced nodes.');
+    }
+    snapshotNodes = nodes;
     snapshotMs = Number((performance.now() - tSnap0).toFixed(2));
 
     const tShot0 = performance.now();
@@ -255,7 +269,7 @@ export async function runWdaAttachSequence(
     screenshotBytes = (await fs.stat(options.screenshotPath)).size;
 
     if (options.tap) {
-      const target = resolveTapPoint(snapshotResult.nodes, options.tap);
+      const target = resolveTapPoint(snapshotNodes, options.tap);
       if (options.dryRun) {
         tapResult = { executed: false, ...target };
       } else {
@@ -304,8 +318,8 @@ export async function runWdaAttachSequence(
       backend: snapshotResult.backend,
       producer: snapshotResult.producer,
       ...(snapshotResult.viewport ? { viewport: snapshotResult.viewport } : {}),
-      nodeCount: snapshotResult.nodes.length,
-      sampleNodes: snapshotResult.nodes.slice(0, 30).map((node) => ({
+      nodeCount: snapshotNodes.length,
+      sampleNodes: snapshotNodes.slice(0, 30).map((node) => ({
         ref: node.ref,
         ...(node.type ? { type: node.type } : {}),
         ...(node.label ? { label: node.label } : {}),

@@ -20,12 +20,19 @@ export type { WebDriverAuth, WebDriverRequestPolicy } from './webdriver-transpor
  */
 const DEFAULT_SESSION_CREATE_TIMEOUT_MS = 180_000;
 
+export type GuardedWdaTap = (request: {
+  sessionId: string;
+  x: number;
+  y: number;
+}) => Promise<void>;
+
 export type WebDriverClientOptions = {
   clientVersion: string;
   endpoint: string | URL;
   auth?: WebDriverAuth;
   headers?: Record<string, string>;
   requestPolicy?: WebDriverRequestPolicy;
+  guardedWdaTap?: GuardedWdaTap;
 };
 
 export type WebDriverSession = {
@@ -77,9 +84,11 @@ export class WebDriverClient {
   private readonly sessionCreateTimeoutMs: number;
   private sessionId: string | undefined;
   private sessionOwnership: WebDriverSessionOwnership = 'owned';
+  private readonly guardedWdaTap: GuardedWdaTap | undefined;
 
   constructor(options: WebDriverClientOptions) {
     this.transport = new WebDriverTransport(options);
+    this.guardedWdaTap = options.guardedWdaTap;
     this.sessionCreateTimeoutMs =
       options.requestPolicy?.sessionCreateTimeoutMs ?? DEFAULT_SESSION_CREATE_TIMEOUT_MS;
   }
@@ -206,6 +215,10 @@ export class WebDriverClient {
   }
 
   async wdaTap(x: number, y: number): Promise<void> {
+    if (this.guardedWdaTap) {
+      await this.guardedWdaTap({ sessionId: this.requireSessionId(), x, y });
+      return;
+    }
     await this.sessionRequest('POST', '/wda/tap', { x, y });
   }
 

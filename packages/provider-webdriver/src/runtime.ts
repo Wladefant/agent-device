@@ -28,6 +28,7 @@ import {
 import { createWebDriverDeploymentRuntime } from './runtime-deployment.ts';
 import { WebDriverSessionManager } from './runtime-session.ts';
 import type {
+  GuardedWdaTap,
   WebDriverAuth,
   WebDriverRequestPolicy,
   WebDriverRouteProfile,
@@ -107,6 +108,7 @@ export type CloudWebDriverRuntimeOptions = {
   existingSessionId?: string;
   sessionOwnership?: WebDriverSessionOwnership;
   routeProfile?: WebDriverRouteProfile;
+  guardedWdaTap?: GuardedWdaTap;
   uploadApp?: CloudWebDriverUploadApp;
   listArtifacts?: CloudWebDriverListArtifacts;
   deviceId?: (lease: DeviceLease) => string;

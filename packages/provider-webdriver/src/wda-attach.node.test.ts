@@ -137,14 +137,14 @@ test('WDA routeProfile routes open, close, and home to WDA endpoints', async () 
       runId: 'r1',
       clientId: 'c1',
       leaseProvider: 'wda-attach',
-      backend: 'ios-device' as const,
+      backend: 'ios-instance' as const,
       deviceKey: 'wda-attach:UDID-1',
       createdAt: 1,
       expiresAt: 2,
       heartbeatAt: 1,
     };
     const device = {
-      platform: 'ios' as const,
+      platform: 'apple' as const,
       target: 'mobile' as const,
       appleOs: 'ios' as const,
       id: 'UDID-1',
@@ -156,7 +156,7 @@ test('WDA routeProfile routes open, close, and home to WDA endpoints', async () 
       await runtime.leaseLifecycle.allocate!(lease);
       const interactor = runtime.getInteractor(device)!;
       await interactor.open('com.wladefant.heylolo.dev');
-      await interactor.home();
+      await interactor.home!();
       await interactor.close('com.wladefant.heylolo.dev');
       await runtime.leaseLifecycle.release!(lease);
     } finally {
@@ -229,7 +229,7 @@ test('WDA attach refuses existingSessionId with sessionOwnership=owned and attac
             runId: 'r1',
             clientId: 'c1',
             leaseProvider: 'wda-attach',
-            backend: 'ios-device',
+            backend: 'ios-instance',
             deviceKey: 'wda-attach:UDID-1',
             createdAt: 1,
             expiresAt: 2,
@@ -242,3 +242,54 @@ test('WDA attach refuses existingSessionId with sessionOwnership=owned and attac
     }
   });
 });
+
+for (const refuse of [false, true]) {
+  test(`WDA tap delegates to the owner guard without raw fallback when guard ${refuse ? 'refuses' : 'accepts'}`, async () => {
+    await withMockWdaServer('com.wladefant.heylolo.dev', async ({ endpoint, requests }) => {
+      const guarded: Array<{ sessionId: string; x: number; y: number }> = [];
+      const runtime = createWdaAttachRuntime({
+        endpoint,
+        sessionId: 'SESS-1',
+        udid: 'UDID-1',
+        guardedWdaTap: async (request) => {
+          guarded.push(request);
+          if (refuse) throw new Error('owner guard refused notification banner');
+        },
+      });
+      const lease = {
+        leaseId: 'guarded-lease',
+        tenantId: 't1',
+        runId: 'r1',
+        clientId: 'c1',
+        leaseProvider: 'wda-attach',
+        backend: 'ios-instance' as const,
+        deviceKey: 'wda-attach:UDID-1',
+        createdAt: 1,
+        expiresAt: 2,
+        heartbeatAt: 1,
+      };
+      const device = {
+        platform: 'apple' as const,
+        target: 'mobile' as const,
+        appleOs: 'ios' as const,
+        id: 'UDID-1',
+        name: 'Attached iOS Device',
+        kind: 'device' as const,
+        booted: true,
+      };
+      try {
+        await runtime.leaseLifecycle.allocate!(lease);
+        const interactor = runtime.getInteractor(device)!;
+        if (refuse) {
+          await assert.rejects(() => interactor.tap(73, 792), /owner guard refused/);
+        } else {
+          await interactor.tap(73, 792);
+        }
+        assert.deepEqual(guarded, [{ sessionId: 'SESS-1', x: 73, y: 792 }]);
+      } finally {
+        await runtime.shutdown();
+      }
+      assert.deepEqual(requests, []);
+    });
+  });
+}
