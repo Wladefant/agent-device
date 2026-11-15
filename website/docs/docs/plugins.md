@@ -29,6 +29,29 @@ Install only packages you trust: plugin factories run with the daemon's host per
 
 A failed install keeps the previous selection. A running daemon keeps the plugin set and files it started with, including removed installations. To apply changes, close sessions and run `agent-device daemon stop` with the matching `--state-dir`; the next device command uses the new set. Use separate state directories for different plugin homes.
 
+## Trusted local packed plugins
+
+To install a packed `.tgz` or `.tar.gz` plugin tarball without publishing to npm, pass an absolute regular file path, a 64-hex SHA-256 pin, and the explicit opt-in flag:
+
+```bash
+agent-device plugins add @example/agent-device-provider \
+  --local-tarball /absolute/path/to/provider.tgz \
+  --sha256 <64-hex-sha256> \
+  --allow-local-package
+```
+
+Local tarball installs reject `@version` or `@tag` suffixes, relative paths, URLs, symbolic links, non-regular files, and missing or mismatched SHA-256 digests before `npm` runs. Config files and environment variables cannot supply `--local-tarball`, `--sha256`, or `--allow-local-package`.
+
+Before running `npm`, `agent-device` copies the tarball bytes into a private staging directory, verifies the SHA-256 digest on the staged copy, installs only from that staged copy with lifecycle scripts disabled, verifies package identity and staged archive integrity, and then promotes the selection. Any failure cleans up only the failed staging directory and keeps the prior active selection.
+
+Updating a locally installed plugin keeps its pinned tarball path and SHA-256 unless you replace both `--local-tarball` and `--sha256` together, and requires `--allow-local-package` again:
+
+```bash
+agent-device plugins update @example/agent-device-provider --allow-local-package
+```
+
+`plugins remove` rejects local tarball flags.
+
 ## See which providers are registered
 
 `agent-device daemon status` lists every provider the running daemon registered: the bundled ones (BrowserStack, AWS Device Farm, and Limrun when it is configured), then installed plugins. With `--json`, each entry has:
