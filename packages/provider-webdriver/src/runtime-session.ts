@@ -32,6 +32,7 @@ export type WebDriverProviderSession = Readonly<{
   capabilities: CloudWebDriverProviderCapabilities;
   webDriverSessionId: string;
   providerSessionId: string;
+  sessionOwnership: 'owned' | 'attached';
 }>;
 
 type CloudWebDriverReleaseWarning = Readonly<{
@@ -300,6 +301,7 @@ export class WebDriverSessionManager {
       auth: prepared.auth,
       headers: prepared.headers,
       requestPolicy: this.options.requestPolicy,
+      guardedWdaTap: this.options.guardedWdaTap,
     });
     const session = await this.createSessionWithPreparedCleanup(client, prepared, lease, req);
     const device = this.deviceForLease(lease, prepared);
@@ -316,11 +318,16 @@ export class WebDriverSessionManager {
       capabilities,
       webDriverSessionId: session.sessionId,
       providerSessionId: prepared.providerSessionId ?? session.sessionId,
+      sessionOwnership:
+        prepared.existingSessionId !== undefined
+          ? 'attached'
+          : (prepared.sessionOwnership ?? 'owned'),
       interactor: createWebDriverInteractor({
         client,
         backend: snapshotBackendForPlatform(prepared.platform),
         capabilities,
         targetId: device.id,
+        routeProfile: prepared.routeProfile,
       }),
     });
   }
@@ -389,13 +396,15 @@ export class WebDriverSessionManager {
     this.releasedProviderSessionIdsByLeaseId.set(entry.lease.leaseId, session.providerSessionId);
     const warnings: CloudWebDriverReleaseWarning[] = [];
     let cleanupPayload: Record<string, unknown> | undefined;
-    try {
-      await session.client.deleteSession();
-    } catch (error) {
-      warnings.push({
-        code: 'WEBDRIVER_SESSION_DELETE_FAILED',
-        message: errorMessage(error),
-      });
+    if (session.sessionOwnership !== 'attached') {
+      try {
+        await session.client.deleteSession();
+      } catch (error) {
+        warnings.push({
+          code: 'WEBDRIVER_SESSION_DELETE_FAILED',
+          message: errorMessage(error),
+        });
+      }
     }
     try {
       cleanupPayload = await this.providerCallback(
@@ -490,6 +499,15 @@ export class WebDriverSessionManager {
     req: LeaseLifecycleContext | undefined,
   ): Promise<WebDriverSession> {
     try {
+      if (prepared.existingSessionId !== undefined) {
+        if (prepared.sessionOwnership === 'owned') {
+          throw new AppError(
+            'INVALID_ARGS',
+            'existingSessionId cannot be combined with sessionOwnership: "owned".',
+          );
+        }
+        return client.attachSession(prepared.existingSessionId, prepared.webdriverCapabilities);
+      }
       return await client.createSession(prepared.webdriverCapabilities, {
         deadline: req?.deadline,
       });
@@ -542,6 +560,15 @@ export class WebDriverSessionManager {
       deviceName: this.options.deviceName,
       auth: this.options.auth,
       headers: this.options.headers,
+      ...(this.options.existingSessionId !== undefined
+        ? { existingSessionId: this.options.existingSessionId }
+        : {}),
+      ...(this.options.sessionOwnership !== undefined
+        ? { sessionOwnership: this.options.sessionOwnership }
+        : {}),
+      ...(this.options.routeProfile !== undefined
+        ? { routeProfile: this.options.routeProfile }
+        : {}),
       webdriverCapabilities: buildCloudWebDriverBaseCapabilities(
         this.options.platform,
         this.options.deviceName,

@@ -20,18 +20,28 @@ export type { WebDriverAuth, WebDriverRequestPolicy } from './webdriver-transpor
  */
 const DEFAULT_SESSION_CREATE_TIMEOUT_MS = 180_000;
 
+export type GuardedWdaTap = (request: {
+  sessionId: string;
+  x: number;
+  y: number;
+}) => Promise<void>;
+
 export type WebDriverClientOptions = {
   clientVersion: string;
   endpoint: string | URL;
   auth?: WebDriverAuth;
   headers?: Record<string, string>;
   requestPolicy?: WebDriverRequestPolicy;
+  guardedWdaTap?: GuardedWdaTap;
 };
 
 export type WebDriverSession = {
   sessionId: string;
   capabilities: Record<string, unknown>;
 };
+
+export type WebDriverSessionOwnership = 'owned' | 'attached';
+export type WebDriverRouteProfile = 'appium' | 'wda';
 
 export type WebDriverWindowRect = {
   x: number;
@@ -73,9 +83,12 @@ export class WebDriverClient {
   private readonly transport: WebDriverTransport;
   private readonly sessionCreateTimeoutMs: number;
   private sessionId: string | undefined;
+  private sessionOwnership: WebDriverSessionOwnership = 'owned';
+  private readonly guardedWdaTap: GuardedWdaTap | undefined;
 
   constructor(options: WebDriverClientOptions) {
     this.transport = new WebDriverTransport(options);
+    this.guardedWdaTap = options.guardedWdaTap;
     this.sessionCreateTimeoutMs =
       options.requestPolicy?.sessionCreateTimeoutMs ?? DEFAULT_SESSION_CREATE_TIMEOUT_MS;
   }
@@ -98,8 +111,26 @@ export class WebDriverClient {
       { timeoutMs: budgetWithin(this.sessionCreateTimeoutMs, options?.deadline) },
     );
     const session = readSession(value);
+    this.sessionOwnership = 'owned';
     this.sessionId = session.sessionId;
     return session;
+  }
+
+  /**
+   * Attaches to an existing sole-owner WebDriver/WDA session without calling `POST /session`.
+   * An attached session is never terminated by `deleteSession()`.
+   */
+  attachSession(
+    sessionId: string,
+    capabilities: Record<string, unknown> = {},
+  ): WebDriverSession {
+    const normalized = sessionId.trim();
+    if (!normalized) {
+      throw new AppError('INVALID_ARGS', 'Existing WebDriver sessionId must not be empty.');
+    }
+    this.sessionId = normalized;
+    this.sessionOwnership = 'attached';
+    return { sessionId: normalized, capabilities };
   }
 
   /**
@@ -110,6 +141,11 @@ export class WebDriverClient {
    */
   async deleteSession(): Promise<void> {
     const sessionId = this.requireSessionId();
+    if (this.sessionOwnership === 'attached') {
+      this.sessionId = undefined;
+      this.sessionOwnership = 'owned';
+      return;
+    }
     try {
       await this.requestValue('DELETE', `/session/${sessionId}`, undefined, { idempotent: true });
     } catch (error) {
@@ -154,6 +190,36 @@ export class WebDriverClient {
         status,
       });
     }
+  }
+
+  async status(overrides?: WebDriverRequestOverrides): Promise<Record<string, unknown>> {
+    const value = await this.requestValue('GET', '/status', undefined, overrides);
+    return value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  }
+
+  async wdaActiveAppInfo(overrides?: WebDriverRequestOverrides): Promise<Record<string, unknown>> {
+    const value = await this.sessionRequest('GET', '/wda/activeAppInfo', undefined, overrides);
+    return value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  }
+
+  async wdaActivateApp(bundleId: string): Promise<void> {
+    await this.sessionRequest('POST', '/wda/apps/activate', { bundleId });
+  }
+
+  async wdaTerminateApp(bundleId: string): Promise<void> {
+    await this.sessionRequest('POST', '/wda/apps/terminate', { bundleId });
+  }
+
+  async wdaHome(): Promise<void> {
+    await this.requestValue('POST', '/wda/homescreen', {});
+  }
+
+  async wdaTap(x: number, y: number): Promise<void> {
+    if (this.guardedWdaTap) {
+      await this.guardedWdaTap({ sessionId: this.requireSessionId(), x, y });
+      return;
+    }
+    await this.sessionRequest('POST', '/wda/tap', { x, y });
   }
 
   async performActions(actions: W3CActionSequence[]): Promise<void> {
